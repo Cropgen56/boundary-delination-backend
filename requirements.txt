@@ -1,0 +1,22 @@
+# API
+fastapi
+uvicorn[standard]
+python-multipart
+
+# ML
+torch
+segmentation-models-pytorch
+
+# Satellite data
+xarray
+netCDF4
+rasterio
+pyproj
+
+# Geospatial / GeoJSON conversion
+shapely
+
+# Preprocessing
+numpy
+scipy
+albumentations

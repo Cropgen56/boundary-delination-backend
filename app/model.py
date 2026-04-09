@@ -1,6 +1,6 @@
 import torch
 import segmentation_models_pytorch as smp 
-from config import N_CHANNELS, CHECKPOINT_PATH
+from app.config import N_CHANNELS, CHECKPOINT_PATH
 
 def load_model():
     model = smp.Unet(

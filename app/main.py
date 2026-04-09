@@ -2,13 +2,18 @@ import tempfile, os
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import FileResponse
 import torch
-from model import load_model
-from inference import preprocess, postprocess, mask_to_geojson
+from uvicorn import lifespan
+from app.model import load_model
+from app.inference import preprocess, postprocess, mask_to_geojson
 import rasterio, numpy as np
-from schema import PredictionResponse, HealthResponse, ErrorResponse
+from app.schema import PredictionResponse, HealthResponse, ErrorResponse
 
 
-app = FastAPI()
+app = FastAPI(
+    title="Field Boundary Detection API - v1.0 (Base Model), 30CH Input",
+    description="Initial production release featuring the 30-channel NetCDF inference engine. This version establishes the core FastAPI infrastructure, handles file-based inference requests, and implements the foundational raster-to-GeoJSON vectorization logic for agricultural field extraction.",
+    version="1.0.1"
+)
 
 # Load model once at startup — critical for performance
 model = load_model()
@@ -16,7 +21,7 @@ model = load_model()
 from fastapi.responses import JSONResponse
 import json
 
-@app.post("/predict")
+@app.post("/api/v1/predict")
 async def predict(file: UploadFile = File(...)):
     with tempfile.NamedTemporaryFile(suffix=".nc", delete=False) as tmp:
         tmp.write(await file.read())

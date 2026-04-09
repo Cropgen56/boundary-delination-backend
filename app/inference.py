@@ -3,7 +3,7 @@ import os
 import numpy as np
 import xarray as xr
 import torch
-from config import BAND_VARS, N_TIMESTEPS, REFLECTANCE_SCALE, MEAN, STD
+from app.config import BAND_VARS, N_TIMESTEPS, REFLECTANCE_SCALE, MEAN, STD
 from rasterio.transform import from_bounds
 
 def load_nc_as_array(nc_path):

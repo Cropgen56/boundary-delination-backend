@@ -19,4 +19,5 @@ shapely
 # Preprocessing
 numpy
 scipy
+scikit-image
 albumentations

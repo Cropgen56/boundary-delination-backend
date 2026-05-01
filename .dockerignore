@@ -1,6 +1,10 @@
-# .dockerignore
+--# .dockerignore
 .venv/
 __pycache__/
 *.pyc
 .git/
 .env
+
+# Model weights — mount as a volume at runtime, never bake into image
+checkpoints/
+*.pth

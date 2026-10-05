@@ -15,7 +15,8 @@ COPY requirements.txt /app/
 
 RUN pip install --default-timeout=1000 --no-cache-dir -r requirements.txt
 
-COPY . .
+COPY app/ /app/app/
+COPY checkpoints/ /app/checkpoints/
 
 EXPOSE 8000
 

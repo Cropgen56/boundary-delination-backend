@@ -1,7 +1,7 @@
 """
 inference.py — v2 field boundary pipeline
 ==========================================
-Input  : center coordinates (lat, lon) + AOI side length in km
+Input  : village GeoJSON Feature(s) with Polygon or MultiPolygon geometry
 Output : GeoJSON FeatureCollection of field polygons
 
 Pipeline
@@ -25,8 +25,8 @@ import pyproj
 
 from PIL import Image
 from shapely.geometry import shape, mapping, MultiPolygon
-from shapely.ops import unary_union
-from rasterio.features import shapes as rio_shapes
+from shapely.ops import transform as transform_geometry, unary_union
+from rasterio.features import geometry_mask, shapes as rio_shapes
 from rasterio.transform import from_bounds
 from skimage.segmentation import watershed
 from skimage.morphology import binary_closing, disk, remove_small_objects, h_minima
@@ -55,15 +55,6 @@ def _utm_crs(lon: float, lat: float) -> str:
     zone = int((lon + 180) / 6) + 1
     epsg = 32600 + zone if lat >= 0 else 32700 + zone
     return f'EPSG:{epsg}'
-
-
-def _aoi_utm_bounds(center_lat: float, center_lon: float,
-                    box_km: float, utm_crs: str) -> tuple[float, float, float, float]:
-    """Convert a centre point + square side length to a UTM bounding box."""
-    t = pyproj.Transformer.from_crs('EPSG:4326', utm_crs, always_xy=True)
-    cx, cy = t.transform(center_lon, center_lat)
-    half = (box_km * 1000) / 2
-    return cx - half, cy - half, cx + half, cy + half
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -246,13 +237,16 @@ def _remove_daggers(poly, max_w: float = 2.0, min_notch_area: float = 20.0):
             if isinstance(out, MultiPolygon) else out)
 
 
-def postprocess_polygons(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+def postprocess_polygons(gdf: gpd.GeoDataFrame, clip_geometry=None) -> gpd.GeoDataFrame:
     """Apply dagger removal, RDP simplification and median-area filter."""
     gdf = gdf.copy()
     gdf['geometry'] = [_remove_daggers(g, DAGGER_WIDTH_M) for g in gdf.geometry]
     gdf['geometry'] = [g.simplify(SIMPLIFY_TOL_M, preserve_topology=True)
                        for g in gdf.geometry]
+    if clip_geometry is not None:
+        gdf['geometry'] = [g.intersection(clip_geometry) for g in gdf.geometry]
     gdf = gdf[gdf.geometry.notna() & ~gdf.geometry.is_empty & gdf.geometry.is_valid]
+    gdf = gdf[gdf.geometry.geom_type.isin(['Polygon', 'MultiPolygon'])]
 
     if gdf.empty:
         return gdf
@@ -270,16 +264,13 @@ def postprocess_polygons(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
 # Public entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
-def extract_fields(center_lat: float, center_lon: float,
-                   box_km: float, model, device) -> dict:
+def extract_fields(village_feature: dict, model, device) -> dict:
     """
     End-to-end field boundary extraction.
 
     Parameters
     ----------
-    center_lat : AOI centre latitude  (WGS84)
-    center_lon : AOI centre longitude (WGS84)
-    box_km     : AOI side length in km  (2 – 10)
+    village_feature : GeoJSON Feature with a Polygon or MultiPolygon in WGS84
     model      : loaded TripleHeadModel
     device     : torch.device
 
@@ -287,14 +278,32 @@ def extract_fields(center_lat: float, center_lon: float,
     -------
     GeoJSON FeatureCollection dict (WGS84 coordinates)
     """
-    utm_crs = _utm_crs(center_lon, center_lat)
-    minx, miny, maxx, maxy = _aoi_utm_bounds(center_lat, center_lon, box_km, utm_crs)
+    if village_feature.get('type') != 'Feature' or not village_feature.get('geometry'):
+        raise ValueError('Each village must be a GeoJSON Feature with a geometry.')
+
+    village_wgs84 = shape(village_feature['geometry'])
+    if (village_wgs84.is_empty or not village_wgs84.is_valid
+            or village_wgs84.geom_type not in ('Polygon', 'MultiPolygon')):
+        raise ValueError('Village geometry must be a valid Polygon or MultiPolygon.')
+
+    representative_point = village_wgs84.representative_point()
+    utm_crs = _utm_crs(representative_point.x, representative_point.y)
+    projector = pyproj.Transformer.from_crs('EPSG:4326', utm_crs, always_xy=True)
+    village_utm = transform_geometry(projector.transform, village_wgs84)
+    minx, miny, maxx, maxy = village_utm.bounds
 
     # 1. Imagery
     mosaic, transform = fetch_imagery(minx, miny, maxx, maxy, utm_crs)
 
     # 2. Inference
     extent_prob, boundary_prob, distance_pred = run_inference(model, mosaic, device)
+    village_mask = geometry_mask(
+        [mapping(village_utm)],
+        out_shape=extent_prob.shape,
+        transform=transform,
+        invert=True,
+    )
+    extent_prob = np.where(village_mask, extent_prob, 0)
 
     # 3. Instances
     labels = extract_instances(extent_prob, boundary_prob, distance_pred)
@@ -312,7 +321,7 @@ def extract_fields(center_lat: float, center_lon: float,
     )
 
     # 4. Post-process
-    gdf = postprocess_polygons(gdf)
+    gdf = postprocess_polygons(gdf, clip_geometry=village_utm)
     if gdf.empty:
         return {'type': 'FeatureCollection', 'features': []}
 

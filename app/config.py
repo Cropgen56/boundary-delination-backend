@@ -10,10 +10,6 @@ SIMPLIFY_TOL_M  = 2.0    # Douglas-Peucker simplification tolerance in metres
 DAGGER_WIDTH_M  = 2.0    # max spike width to fill in dagger-removal step
 MIN_AREA_FRAC   = 0.10   # drop polygons below this fraction of median field area
 
-# ── AOI limits ────────────────────────────────────────────────────────────────
-AOI_KM_MIN      = 2.0    # minimum AOI side length in km
-AOI_KM_MAX      = 10.0   # maximum AOI side length in km
-
 # ── Model checkpoint ──────────────────────────────────────────────────────────
 BASE_DIR        = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Place ft_best.pt in the checkpoints/ folder (downloaded from Drive)

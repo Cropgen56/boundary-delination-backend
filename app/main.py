@@ -10,8 +10,8 @@ app = FastAPI(
     title="Field Boundary Detection API — v2.0",
     description=(
         "Triple-head EfficientNet-B4 UNet model (fine-tuned on Kurankhed data). "
-        "Pass a centre coordinate and an AOI size (2 – 10 km²) to get a "
-        "GeoJSON FeatureCollection of delineated field boundaries."
+        "Pass village GeoJSON from the boundary service to get field boundaries "
+        "clipped to each village polygon. Multiple villages can be processed together."
     ),
     version="2.0.0",
 )
@@ -26,10 +26,11 @@ model.to(device)
 
 @app.post(
     "/api/v1/predict",
-    summary="Delineate field boundaries for a given location & AOI size",
+    summary="Delineate field boundaries within village GeoJSON",
     responses={
-        200: {"description": "GeoJSON FeatureCollection of predicted field polygons"},
-        422: {"model": ErrorResponse, "description": "Validation error (e.g. box_km out of range)"},
+        200: {"description": "Per-village predictions clipped to supplied village boundaries"},
+        422: {"model": ErrorResponse, "description": "Invalid village GeoJSON"},
+        404: {"model": ErrorResponse, "description": "No villages match the requested taluka"},
         500: {"model": ErrorResponse, "description": "Internal inference error"},
     },
 )
@@ -39,24 +40,53 @@ async def predict(req: PredictRequest):
 
     | Field | Type | Required | Default | Description |
     |-------|------|----------|---------|-------------|
-    | `center_lat` | float | ✅ | — | Latitude of AOI centre (WGS84) |
-    | `center_lon` | float | ✅ | — | Longitude of AOI centre (WGS84) |
-    | `box_km` | float | ❌ | `3.0` | AOI side length in km — **2 to 10** |
+    | `geojson` | object or array | ✅ | — | Village Feature, FeatureCollection, or array of Features |
+    | `taluka` | string | ❌ | — | Filter supplied village Features by `properties.taluka` |
 
     **Example**
     ```json
-    { "center_lat": 17.702059, "center_lon": 76.006878, "box_km": 5.0 }
+    { "geojson": { "type": "Feature", "geometry": { "type": "Polygon", "coordinates": [] }, "properties": { "name": "Mangrud", "taluka": "Bhiwapur" } }, "taluka": "Bhiwapur" }
     ```
     """
     try:
-        geojson = extract_fields(
-            center_lat=req.center_lat,
-            center_lon=req.center_lon,
-            box_km=req.box_km,
-            model=model,
-            device=device,
-        )
-        return JSONResponse(content=geojson)
+        if isinstance(req.geojson, list):
+            villages = req.geojson
+        elif req.geojson.get("type") == "Feature":
+            villages = [req.geojson]
+        elif req.geojson.get("type") == "FeatureCollection":
+            villages = req.geojson.get("features", [])
+        else:
+            raise ValueError("geojson must be a Feature, FeatureCollection, or array of Features")
+
+        if not villages or any(village.get("type") != "Feature" for village in villages):
+            raise ValueError("geojson must contain at least one GeoJSON Feature")
+
+        if req.taluka:
+            requested_taluka = req.taluka.strip().casefold()
+            villages = [
+                village for village in villages
+                if str((village.get("properties") or {}).get("taluka", "")).strip().casefold()
+                == requested_taluka
+            ]
+            if not villages:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"No village features found for taluka '{req.taluka}'.",
+                )
+
+        results = []
+        for village in villages:
+            properties = village.get("properties") or {}
+            results.append({
+                "village": properties.get("name"),
+                "taluka": properties.get("taluka"),
+                "geojson": extract_fields(village, model=model, device=device),
+            })
+        return JSONResponse(content={"taluka": req.taluka, "villages": results})
+    except HTTPException:
+        raise
+    except (TypeError, ValueError, KeyError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 

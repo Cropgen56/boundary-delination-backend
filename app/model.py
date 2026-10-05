@@ -41,7 +41,7 @@ class TripleHeadModel(nn.Module):
 
     def forward(self, x: torch.Tensor):
         features    = self.encoder(x)
-        decoder_out = self.decoder(features)
+        decoder_out = self.decoder(*features)
 
         extent   = self.extent_head(self.extent_dropout(decoder_out))
         boundary = self.boundary_head(self.boundary_dropout(decoder_out))

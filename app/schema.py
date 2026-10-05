@@ -1,32 +1,21 @@
+from typing import Any
+
 from pydantic import BaseModel, Field
 
 
 class PredictRequest(BaseModel):
     """Request body for /api/v1/predict"""
 
-    center_lat: float = Field(
+    geojson: dict[str, Any] | list[dict[str, Any]] = Field(
         ...,
-        description="Latitude of the AOI centre point (WGS84, decimal degrees).",
-        ge=-90.0,
-        le=90.0,
-        examples=[17.702059],
-    )
-    center_lon: float = Field(
-        ...,
-        description="Longitude of the AOI centre point (WGS84, decimal degrees).",
-        ge=-180.0,
-        le=180.0,
-        examples=[76.006878],
-    )
-    box_km: float = Field(
-        3.0,
         description=(
-            "Side length of the square AOI in kilometres. "
-            "Select between 2 km × 2 km and 10 km × 10 km."
+            "A village GeoJSON Feature, FeatureCollection, or array of Features "
+            "returned by the boundary service. Coordinates must be WGS84."
         ),
-        ge=2.0,
-        le=10.0,
-        examples=[2.0, 3.0, 5.0, 7.5, 10.0],
+    )
+    taluka: str | None = Field(
+        None,
+        description="Optionally process only features whose properties.taluka matches this name.",
     )
 
 

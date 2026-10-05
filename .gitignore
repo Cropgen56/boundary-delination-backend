@@ -6,6 +6,7 @@ __pycache__/
 checkpoints/
 *.pth
 *.pt
+example/
 
 # Environment
 .venv

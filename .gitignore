@@ -2,10 +2,13 @@
 __pycache__/
 *.pyc
 
-# ML models
+# ML models — never commit weights to git; download from Drive
 checkpoints/
 *.pth
+*.pt
 
-
-
+# Environment
 .venv
+
+# macOS
+.DS_Store

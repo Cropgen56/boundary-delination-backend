@@ -1,14 +1,20 @@
-import numpy as np
 import os
 
-N_CHANNELS = 4
-NUM_CLASSES = 3
-PATCH_SIZE = 256
+# ── Inference hyperparameters (tuned from held-out evaluation) ────────────────
+PATCH_PX        = 256
+RES_M           = 1.0    # imagery resolution in metres per pixel
 
-# Global Normalization Stats (Calculated from Colab)
-MEAN = np.array([0.05420399, 0.07465479, 0.06314979, 0.29062513], dtype=np.float32)
-STD = np.array([0.02797917, 0.02933381, 0.03717266, 0.12625116], dtype=np.float32)
+OVERSEG_H       = 0.18   # h-minima depth for watershed seeding (lower = more regions)
+EXTENT_THRESH   = 0.5    # binary threshold on extent probability map
+SIMPLIFY_TOL_M  = 2.0    # Douglas-Peucker simplification tolerance in metres
+DAGGER_WIDTH_M  = 2.0    # max spike width to fill in dagger-removal step
+MIN_AREA_FRAC   = 0.10   # drop polygons below this fraction of median field area
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-# Make sure you place the new model file in the checkpoints folder!
-CHECKPOINT_PATH = os.path.join(BASE_DIR, "checkpoints", "best_model_v2.pth")
+# ── AOI limits ────────────────────────────────────────────────────────────────
+AOI_KM_MIN      = 2.0    # minimum AOI side length in km
+AOI_KM_MAX      = 10.0   # maximum AOI side length in km
+
+# ── Model checkpoint ──────────────────────────────────────────────────────────
+BASE_DIR        = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Place ft_best.pt in the checkpoints/ folder (downloaded from Drive)
+CHECKPOINT_PATH = os.path.join(BASE_DIR, "checkpoints", "ft_best.pt")

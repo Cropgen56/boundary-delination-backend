@@ -1,194 +1,342 @@
-import os
+"""
+inference.py — v2 field boundary pipeline
+==========================================
+Input  : center coordinates (lat, lon) + AOI side length in km
+Output : GeoJSON FeatureCollection of field polygons
+
+Pipeline
+--------
+1. Derive UTM CRS from coordinates
+2. Fetch RGB imagery from ESRI World Imagery (chunked to stay under tile limits)
+3. Sliding-window inference with Hann-window blending (avoids seam artefacts)
+4. H-minima seeded watershed on combined edge/distance map → instance labels
+5. Post-process polygons (dagger removal, RDP simplification, area filter)
+6. Reproject UTM → WGS84, emit GeoJSON
+"""
+
+import io
+import time
+import requests
 
 import numpy as np
-import xarray as xr
 import torch
-from app.config import  MEAN, STD
-from rasterio.transform import from_bounds
-
-def load_nc_as_4ch(nc_path):
-    """
-    Load .nc file → (H, W, 4) float32 array.
-    Takes the median across time for B2, B3, B4, B8.
-    """
-    ds = xr.open_dataset(nc_path)
-    bands = []
-
-    for var in ['B2', 'B3', 'B4', 'B8']:              # (time, H, W) → median → (H, W)
-        arr = ds[var].values
-        median = np.median(arr, axis=0)
-        bands.append(median.astype(np.float32))
-    ds.close()
-
-    return np.stack(bands, axis=-1)                    # (H, W, 4)
-
-def replace_nans(image, fill_value=0.0):
-    return np.nan_to_num(image, nan=fill_value, posinf=fill_value, neginf=fill_value)
-
-def preprocess(nc_path) -> torch.Tensor:
-    img = replace_nans(load_nc_as_4ch(nc_path))        # (256, 256, 4)
-    img = (img - MEAN) / (STD + 1e-8)                         # normalize
-    img = torch.from_numpy(img).permute(2, 0, 1)         # (4, 256, 256)
-    return img.unsqueeze(0)                              # (1, 4, 256, 256)
-
-def postprocess(logits: torch.Tensor) -> np.ndarray:
-    """
-    Convert raw logits (1, 3, H, W) → per-pixel class map (H, W) uint8.
-    Classes: 0=Background  1=Interior  2=Boundary
-    """
-    probs     = torch.softmax(logits, dim=1)          # (1, 3, H, W)
-    class_map = torch.argmax(probs, dim=1)            # (1, H, W)
-    return class_map.squeeze().cpu().numpy().astype(np.uint8)  # (H, W)
-
-
-
-# Step 5b — Convert 3-class mask to GeoJSON (field polygons)
-import json
-from rasterio.features import shapes
-from shapely.geometry import shape, mapping, Polygon
+import geopandas as gpd
 import pyproj
-from scipy import ndimage as ndi
+
+from PIL import Image
+from shapely.geometry import shape, mapping, MultiPolygon
+from shapely.ops import unary_union
+from rasterio.features import shapes as rio_shapes
+from rasterio.transform import from_bounds
 from skimage.segmentation import watershed
-from skimage.feature import peak_local_max
+from skimage.morphology import binary_closing, disk, remove_small_objects, h_minima
+from skimage.filters import sobel
+from scipy import ndimage as ndi
+from scipy.ndimage import gaussian_filter
 
-def _empty_geojson(output_dir):
-    """Write and return path to an empty FeatureCollection."""
-    out_path = os.path.join(output_dir, 'predicted_fields.geojson')
-    with open(out_path, 'w') as f:
-        json.dump({"type": "FeatureCollection", "features": []}, f)
-    return out_path
+from app.config import (
+    PATCH_PX, RES_M,
+    OVERSEG_H, EXTENT_THRESH,
+    SIMPLIFY_TOL_M, DAGGER_WIDTH_M, MIN_AREA_FRAC,
+)
 
-def mask_to_geojson(pred_mask, reference_nc_path, output_dir,
-                    min_area_px=50, simplify_tolerance=1.5,
-                    watershed_min_distance=8):
+# ── ESRI World Imagery tile server ────────────────────────────────────────────
+_ESRI_URL     = ('https://services.arcgisonline.com/arcgis/rest/services/'
+                 'World_Imagery/MapServer/export')
+_MAX_CHUNK_PX = 4000      # max pixels per tile request (ESRI limit)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Coordinate helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _utm_crs(lon: float, lat: float) -> str:
+    """Return the UTM EPSG string appropriate for a given lon/lat."""
+    zone = int((lon + 180) / 6) + 1
+    epsg = 32600 + zone if lat >= 0 else 32700 + zone
+    return f'EPSG:{epsg}'
+
+
+def _aoi_utm_bounds(center_lat: float, center_lon: float,
+                    box_km: float, utm_crs: str) -> tuple[float, float, float, float]:
+    """Convert a centre point + square side length to a UTM bounding box."""
+    t = pyproj.Transformer.from_crs('EPSG:4326', utm_crs, always_xy=True)
+    cx, cy = t.transform(center_lon, center_lat)
+    half = (box_km * 1000) / 2
+    return cx - half, cy - half, cx + half, cy + half
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 1 — imagery fetching
+# ─────────────────────────────────────────────────────────────────────────────
+
+def fetch_imagery(minx: float, miny: float, maxx: float, maxy: float,
+                  utm_crs: str) -> tuple[np.ndarray, object]:
     """
-    Convert 3-class predicted mask → GeoJSON of field polygons.
-    Internally extracts Interior pixels (class=1) as the field binary mask.
+    Download RGB imagery from ESRI World Imagery for a UTM bounding box.
 
-    Steps:
-      1. Build binary mask from Interior class (pred_mask == 1)
-      2. Vectorize raster mask (rasterio.features.shapes)
-      3. Filter out tiny noise polygons (< min_area_px pixels)
-      4. Simplify polygon vertices (reduce file size)
-      5. Reproject from EPSG:3035 → WGS84 (lat/lon) for GeoJSON standard
-      6. Write FeatureCollection to .geojson
-
-    Args:
-        pred_mask        : (H, W) uint8 class map — 0=Background, 1=Interior, 2=Boundary
-        reference_nc_path: original .nc path to read spatial extent from
-        output_dir       : where to save the .geojson
-        min_area_px      : drop polygons smaller than this (noise removal)
-        simplify_tolerance: vertex simplification in CRS units (metres here)
-
-    Returns:
-        path to saved .geojson file
+    Returns
+    -------
+    mosaic    : (3, H, W) uint8 numpy array
+    transform : rasterio Affine transform (UTM coords)
     """
-    # Read spatial extent from the .nc file (EPSG:3035 coords)
-    ds = xr.open_dataset(reference_nc_path)
-    x  = ds['x'].values   # (W,)
-    y  = ds['y'].values   # (H,)
-    ds.close()
+    w_px = int(round((maxx - minx) / RES_M))
+    h_px = int(round((maxy - miny) / RES_M))
 
-    transform = from_bounds(
-        x.min(), y.min(), x.max(), y.max(),
-        pred_mask.shape[1], pred_mask.shape[0]
+    # Reproject corners to Web Mercator (ESRI accepts 3857)
+    proj = pyproj.Transformer.from_crs(utm_crs, 'EPSG:3857', always_xy=True)
+    xs, ys = zip(*[proj.transform(x, y) for x, y in
+                   [(minx, miny), (maxx, miny), (maxx, maxy), (minx, maxy)]])
+    web_minx, web_maxx = min(xs), max(xs)
+    web_miny, web_maxy = min(ys), max(ys)
+
+    def _fetch_tile(x0, y0, x1, y1, pw, ph, retries=4):
+        params = {
+            'bbox': f'{x0},{y0},{x1},{y1}',
+            'bboxSR': 3857, 'imageSR': 3857,
+            'size': f'{pw},{ph}',
+            'format': 'png', 'f': 'image',
+        }
+        for attempt in range(retries):
+            try:
+                r = requests.get(_ESRI_URL, params=params, timeout=60)
+                r.raise_for_status()
+                ct = r.headers.get('Content-Type', '')
+                if 'image' not in ct:
+                    raise ValueError(f'non-image response ({ct}): {r.text[:120]}')
+                return np.array(
+                    Image.open(io.BytesIO(r.content)).convert('RGB')
+                ).transpose(2, 0, 1)
+            except Exception as exc:
+                print(f'    tile fetch retry {attempt + 1}/{retries}: {exc}')
+                time.sleep(2 ** attempt)
+        raise RuntimeError('Imagery tile fetch failed after all retries.')
+
+    nx = int(np.ceil(w_px / _MAX_CHUNK_PX))
+    ny = int(np.ceil(h_px / _MAX_CHUNK_PX))
+    cw    = (web_maxx - web_minx) / nx
+    ch    = (web_maxy - web_miny) / ny
+    cw_px = int(round(w_px / nx))
+    ch_px = int(round(h_px / ny))
+
+    tiles: dict = {}
+    for i in range(nx):
+        for j in range(ny):
+            tiles[(i, j)] = _fetch_tile(
+                web_minx + i * cw,       web_miny + j * ch,
+                web_minx + (i + 1) * cw, web_miny + (j + 1) * ch,
+                cw_px, ch_px,
+            )
+            time.sleep(0.5)   # be polite to the tile server
+
+    # rows are bottom-up in world coords → reverse j for array order
+    mosaic = np.concatenate(
+        [np.concatenate([tiles[(i, j)] for j in reversed(range(ny))], axis=1)
+         for i in range(nx)],
+        axis=2,
     )
+    transform = from_bounds(minx, miny, maxx, maxy, mosaic.shape[2], mosaic.shape[1])
+    return mosaic, transform
 
-    # ── Step 1: Watershed instance separation ────────────────────────────────
-    # Interior mask: only Class 1 pixels define field bodies
-    interior_mask = (pred_mask == 1).astype(np.uint8)
 
-    # Distance transform: each pixel's value = distance to nearest background
-    distance = ndi.distance_transform_edt(interior_mask)
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 2 — sliding-window inference
+# ─────────────────────────────────────────────────────────────────────────────
 
-    # Find the deepest center peak of every distinct field
-    peaks = peak_local_max(distance, min_distance=watershed_min_distance,
-                           labels=interior_mask)
+def run_inference(model, img_uint8: np.ndarray, device,
+                  overlap: int = 64, batch_size: int = 8
+                  ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Overlapping-patch inference with Hann-window blending.
 
-    if len(peaks) == 0:
-        print('No field peaks detected — returning empty GeoJSON.')
-        return _empty_geojson(output_dir)
+    Parameters
+    ----------
+    model       : TripleHeadModel (eval mode)
+    img_uint8   : (3, H, W) uint8 RGB array
+    device      : torch.device
 
-    peak_mask = np.zeros(distance.shape, dtype=bool)
-    peak_mask[tuple(peaks.T)] = True
-    markers, _ = ndi.label(peak_mask)
+    Returns
+    -------
+    extent_prob   : (H, W) float32  — field extent probability
+    boundary_prob : (H, W) float32  — boundary probability
+    distance_pred : (H, W) float32  — distance-to-boundary prediction
+    """
+    img    = img_uint8.astype('float32') / 255.0
+    H, W   = img.shape[1], img.shape[2]
+    stride = PATCH_PX - overlap
 
-    # Flood from peaks outward; build 1-px dams where floods meet
-    separated_labels = watershed(-distance, markers, mask=interior_mask)
+    ph = (stride - (H - PATCH_PX) % stride) % stride if H > PATCH_PX else PATCH_PX - H
+    pw = (stride - (W - PATCH_PX) % stride) % stride if W > PATCH_PX else PATCH_PX - W
+    ip = np.pad(img, ((0, 0), (0, ph + PATCH_PX), (0, pw + PATCH_PX)), mode='reflect')
+    Hp, Wp = ip.shape[1], ip.shape[2]
 
-    # ── Step 2: Vectorize the labeled map ────────────────────────────────────
-    pixel_area_m2 = abs(transform.a * transform.e)
-    min_area_m2   = min_area_px * pixel_area_m2
+    acc  = np.zeros((3, Hp, Wp), 'float32')
+    wsum = np.zeros((Hp, Wp), 'float32')
+    win  = (np.outer(np.hanning(PATCH_PX), np.hanning(PATCH_PX)) + 1e-6).astype('float32')
 
-    field_shapes = []
-    for geom, val in shapes(separated_labels.astype(np.int32), transform=transform):
-        if val == 0:
-            continue          # skip background
-        poly = shape(geom)
-        if poly.area >= min_area_m2:
-            field_shapes.append(poly)
+    coords = [(y, x)
+              for y in range(0, Hp - PATCH_PX + 1, stride)
+              for x in range(0, Wp - PATCH_PX + 1, stride)]
 
-    print(f'\nWatershed: {len(field_shapes)} fields after noise filter (>{min_area_px}px)')
+    with torch.no_grad():
+        for i in range(0, len(coords), batch_size):
+            bc = coords[i:i + batch_size]
+            bi = np.stack([ip[:, y:y + PATCH_PX, x:x + PATCH_PX] for y, x in bc])
+            e, b, d = model(torch.from_numpy(bi).to(device))
+            e = torch.sigmoid(e).cpu().numpy()[:, 0]
+            b = torch.sigmoid(b).cpu().numpy()[:, 0]
+            d = d.cpu().numpy()[:, 0]
+            for (y, x), ee, bb, dd in zip(bc, e, b, d):
+                acc[0, y:y + PATCH_PX, x:x + PATCH_PX] += ee * win
+                acc[1, y:y + PATCH_PX, x:x + PATCH_PX] += bb * win
+                acc[2, y:y + PATCH_PX, x:x + PATCH_PX] += dd * win
+                wsum[y:y + PATCH_PX, x:x + PATCH_PX]   += win
 
-    # ── Step 3: Douglas-Peucker smoothing ────────────────────────────────────
-    field_shapes = [s.simplify(simplify_tolerance, preserve_topology=True)
-                    for s in field_shapes]
+    acc /= np.maximum(wsum, 1e-6)
+    return acc[0, :H, :W], acc[1, :H, :W], acc[2, :H, :W]
 
-    # Reproject EPSG:3035 → WGS84 for standard GeoJSON
-    transformer = pyproj.Transformer.from_crs(
-        'EPSG:3035', 'EPSG:4326', always_xy=True
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 3 — instance extraction (h-minima seeded watershed)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def extract_instances(extent_prob: np.ndarray, boundary_prob: np.ndarray,
+                      distance_pred: np.ndarray) -> np.ndarray:
+    """
+    Combine boundary and distance maps into a joint edge strength image,
+    then seed watershed from h-minima to produce an instance label map.
+
+    Returns label array (H, W) int32 — 0 = background.
+    """
+    dist_norm   = (distance_pred - distance_pred.min()) / (np.ptp(distance_pred) + 1e-9)
+    dist_edges  = sobel(gaussian_filter(dist_norm, sigma=1.0))
+    dist_edges /= (dist_edges.max() + 1e-9)
+
+    edge_strength = np.maximum(boundary_prob / (boundary_prob.max() + 1e-9), dist_edges)
+    edge_smooth   = gaussian_filter(edge_strength, sigma=1.5)
+
+    extent_mask = ndi.binary_fill_holes(
+        binary_closing(extent_prob > EXTENT_THRESH, disk(2))
     )
+    markers, _ = ndi.label(h_minima(edge_smooth, OVERSEG_H))
+    labels      = watershed(edge_smooth, markers, mask=extent_mask)
+    labels      = remove_small_objects(labels, min_size=200)
 
-    def reproject_ring(ring):
-        """Reproject a single LinearRing (exterior or hole) to WGS84."""
-        coords = np.array(ring.coords)
-        lons, lats = transformer.transform(coords[:, 0], coords[:, 1])
-        return list(zip(lons, lats))
+    return labels.astype(np.int32)
 
-    def reproject_shape(geom):
-        """Reproject a Polygon including any interior holes."""
-        exterior = reproject_ring(geom.exterior)
-        holes    = [reproject_ring(h) for h in geom.interiors]
-        return Polygon(exterior, holes)
 
-    # Filter to valid Polygons only and zip with matching field_shapes for area lookup
-    valid_pairs = [
-        (reproject_shape(s), s)
-        for s in field_shapes
-        if s.geom_type == 'Polygon' and not s.is_empty
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 4 — polygon post-processing
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _remove_daggers(poly, max_w: float = 2.0, min_notch_area: float = 20.0):
+    """Fill narrow inward spikes (daggers) via convex-hull notch detection."""
+    if poly.is_empty or not poly.is_valid:
+        return poly
+    notches = poly.convex_hull.difference(poly)
+    if notches.is_empty:
+        return poly
+    parts = list(notches.geoms) if hasattr(notches, 'geoms') else [notches]
+    fill  = [n for n in parts
+             if n.area >= min_notch_area and n.buffer(-max_w / 2).is_empty]
+    if not fill:
+        return poly
+    out = unary_union([poly] + fill)
+    return (max(out.geoms, key=lambda g: g.area)
+            if isinstance(out, MultiPolygon) else out)
+
+
+def postprocess_polygons(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Apply dagger removal, RDP simplification and median-area filter."""
+    gdf = gdf.copy()
+    gdf['geometry'] = [_remove_daggers(g, DAGGER_WIDTH_M) for g in gdf.geometry]
+    gdf['geometry'] = [g.simplify(SIMPLIFY_TOL_M, preserve_topology=True)
+                       for g in gdf.geometry]
+    gdf = gdf[gdf.geometry.notna() & ~gdf.geometry.is_empty & gdf.geometry.is_valid]
+
+    if gdf.empty:
+        return gdf
+
+    med_area = gdf.geometry.area.median()
+    gdf = gdf[gdf.geometry.area >= med_area * MIN_AREA_FRAC].reset_index(drop=True)
+
+    gdf['area_m2']     = gdf.geometry.area.round(1)
+    gdf['area_ha']     = (gdf.geometry.area / 10000).round(3)
+    gdf['perimeter_m'] = gdf.geometry.length.round(1)
+    return gdf
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Public entry point
+# ─────────────────────────────────────────────────────────────────────────────
+
+def extract_fields(center_lat: float, center_lon: float,
+                   box_km: float, model, device) -> dict:
+    """
+    End-to-end field boundary extraction.
+
+    Parameters
+    ----------
+    center_lat : AOI centre latitude  (WGS84)
+    center_lon : AOI centre longitude (WGS84)
+    box_km     : AOI side length in km  (2 – 10)
+    model      : loaded TripleHeadModel
+    device     : torch.device
+
+    Returns
+    -------
+    GeoJSON FeatureCollection dict (WGS84 coordinates)
+    """
+    utm_crs = _utm_crs(center_lon, center_lat)
+    minx, miny, maxx, maxy = _aoi_utm_bounds(center_lat, center_lon, box_km, utm_crs)
+
+    # 1. Imagery
+    mosaic, transform = fetch_imagery(minx, miny, maxx, maxy, utm_crs)
+
+    # 2. Inference
+    extent_prob, boundary_prob, distance_pred = run_inference(model, mosaic, device)
+
+    # 3. Instances
+    labels = extract_instances(extent_prob, boundary_prob, distance_pred)
+
+    raw_polys = [
+        shape(g)
+        for g, v in rio_shapes(labels, mask=labels > 0, transform=transform)
+        if v > 0
     ]
-    reprojected   = [pair[0] for pair in valid_pairs]
-    shapes_for_area = [pair[1] for pair in valid_pairs]
+    if not raw_polys:
+        return {'type': 'FeatureCollection', 'features': []}
 
-    # Build GeoJSON FeatureCollection
-    features = []
-    for i, (geom, src) in enumerate(zip(reprojected, shapes_for_area)):
-        features.append({
-            "type": "Feature",
-            "geometry": mapping(geom),
-            "properties": {
-                "field_id": i + 1,
-                "area_m2": round(src.area, 2),    # measured in EPSG:3035 metres
-                "area_ha": round(src.area / 10000, 4),
-            }
-        })
+    gdf = gpd.GeoDataFrame(
+        {'id': range(len(raw_polys))}, geometry=raw_polys, crs=utm_crs
+    )
 
-    geojson = {
-        "type": "FeatureCollection",
-        "crs": {
-            "type": "name",
-            "properties": {"name": "urn:ogc:def:crs:OGC:1.3:CRS84"}
+    # 4. Post-process
+    gdf = postprocess_polygons(gdf)
+    if gdf.empty:
+        return {'type': 'FeatureCollection', 'features': []}
+
+    # 5. Reproject → WGS84 and build GeoJSON
+    gdf_wgs84 = gdf.to_crs('EPSG:4326')
+    features = [
+        {
+            'type': 'Feature',
+            'geometry': mapping(row.geometry),
+            'properties': {
+                'field_id':    int(row['id']) + 1,
+                'area_m2':     row['area_m2'],
+                'area_ha':     row['area_ha'],
+                'perimeter_m': row['perimeter_m'],
+            },
+        }
+        for _, row in gdf_wgs84.iterrows()
+    ]
+
+    return {
+        'type': 'FeatureCollection',
+        'crs': {
+            'type': 'name',
+            'properties': {'name': 'urn:ogc:def:crs:OGC:1.3:CRS84'},
         },
-        "features": features
+        'features': features,
     }
-
-    out_path = os.path.join(output_dir, 'predicted_fields.geojson')
-    with open(out_path, 'w') as f:
-        json.dump(geojson, f, indent=2)
-
-    total_area_ha = sum(f['properties']['area_ha'] for f in features)
-    print(f'GeoJSON saved        → {out_path}')
-    print(f'Total fields         : {len(features)}')
-    print(f'Total field area     : {total_area_ha:.2f} ha')
-
-    return out_path

@@ -7,17 +7,17 @@ python-multipart
 torch
 segmentation-models-pytorch
 
-# Satellite data
-xarray
-netCDF4
+# Geospatial
 rasterio
 pyproj
-
-# Geospatial / GeoJSON conversion
 shapely
+geopandas
+
+# Imagery / HTTP
+Pillow
+requests
 
 # Preprocessing
 numpy
 scipy
 scikit-image
-albumentations

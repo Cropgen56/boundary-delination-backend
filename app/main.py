@@ -1,58 +1,70 @@
-import tempfile, os
-from fastapi import FastAPI, UploadFile, File
 import torch
-from app.model import load_model
-from app.inference import preprocess, postprocess, mask_to_geojson
-import numpy as np
-from app.schema import PredictionResponse, HealthResponse, ErrorResponse
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 
+from app.model import load_model
+from app.inference import extract_fields
+from app.schema import PredictRequest, HealthResponse, ErrorResponse
 
 app = FastAPI(
-    title="Field Boundary Detection API - v2.0 (4-Channel Input)",
-    description="v2 release: upgraded to 4-channel (B2, B3, B4, B8) median-composite NetCDF input. Runs UNet/ResNet34 for field boundary delineation and returns a GeoJSON FeatureCollection.",
-    version="1.0.1"
+    title="Field Boundary Detection API — v2.0",
+    description=(
+        "Triple-head EfficientNet-B4 UNet model (fine-tuned on Kurankhed data). "
+        "Pass a centre coordinate and an AOI size (2 – 10 km²) to get a "
+        "GeoJSON FeatureCollection of delineated field boundaries."
+    ),
+    version="2.0.0",
 )
 
-# Load model once at startup — critical for performance
-model = load_model()
+# ── Load model once at startup (critical for performance) ─────────────────────
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model  = load_model()
+model.to(device)
 
-from fastapi.responses import JSONResponse
-import json
 
-@app.post("/api/v1/predict")
-async def predict(file: UploadFile = File(...)):
-    with tempfile.NamedTemporaryFile(suffix=".nc", delete=False) as tmp:
-        tmp.write(await file.read())
-        tmp_path = tmp.name
+# ── Routes ─────────────────────────────────────────────────────────────────────
 
+@app.post(
+    "/api/v1/predict",
+    summary="Delineate field boundaries for a given location & AOI size",
+    responses={
+        200: {"description": "GeoJSON FeatureCollection of predicted field polygons"},
+        422: {"model": ErrorResponse, "description": "Validation error (e.g. box_km out of range)"},
+        500: {"model": ErrorResponse, "description": "Internal inference error"},
+    },
+)
+async def predict(req: PredictRequest):
+    """
+    **Request body fields**
+
+    | Field | Type | Required | Default | Description |
+    |-------|------|----------|---------|-------------|
+    | `center_lat` | float | ✅ | — | Latitude of AOI centre (WGS84) |
+    | `center_lon` | float | ✅ | — | Longitude of AOI centre (WGS84) |
+    | `box_km` | float | ❌ | `3.0` | AOI side length in km — **2 to 10** |
+
+    **Example**
+    ```json
+    { "center_lat": 17.702059, "center_lon": 76.006878, "box_km": 5.0 }
+    ```
+    """
     try:
-        with torch.no_grad():
-            tensor = preprocess(tmp_path)          # (1, 4, 256, 256)
-            logits = model(tensor)
-
-        pred_mask = postprocess(logits)         # (H, W) uint8 — values: 0=Bg, 1=Interior, 2=Boundary
-
-        geojson_path = mask_to_geojson(
-            pred_mask,
-            reference_nc_path=tmp_path,
-            output_dir=tempfile.gettempdir()
+        geojson = extract_fields(
+            center_lat=req.center_lat,
+            center_lon=req.center_lon,
+            box_km=req.box_km,
+            model=model,
+            device=device,
         )
-
-        with open(geojson_path) as f:
-            geojson_data = json.load(f)
-
-        return JSONResponse(content=geojson_data)
-
-    finally:
-        os.unlink(tmp_path)   # always clean up upload
+        return JSONResponse(content=geojson)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@app.get("/health", response_model=HealthResponse)
+@app.get("/health", response_model=HealthResponse, summary="Health check")
 def health():
     return HealthResponse(
         status="ok",
         model_loaded=model is not None,
-        device=str(next(model.parameters()).device)
+        device=str(next(model.parameters()).device),
     )
-    
-    

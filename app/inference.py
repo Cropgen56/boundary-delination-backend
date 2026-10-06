@@ -15,6 +15,7 @@ Pipeline
 """
 
 import io
+import logging
 import time
 import requests
 
@@ -44,6 +45,15 @@ from app.config import (
 _ESRI_URL     = ('https://services.arcgisonline.com/arcgis/rest/services/'
                  'World_Imagery/MapServer/export')
 _MAX_CHUNK_PX = 4000      # max pixels per tile request (ESRI limit)
+logger = logging.getLogger(__name__)
+
+
+class ImageryFetchError(RuntimeError):
+    """Raised when imagery cannot be fetched from the configured provider."""
+
+
+class InvalidVillageGeometryError(ValueError):
+    """Raised when a village feature does not contain valid polygon geometry."""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -71,6 +81,7 @@ def fetch_imagery(minx: float, miny: float, maxx: float, maxy: float,
     mosaic    : (3, H, W) uint8 numpy array
     transform : rasterio Affine transform (UTM coords)
     """
+    started_at = time.perf_counter()
     w_px = int(round((maxx - minx) / RES_M))
     h_px = int(round((maxy - miny) / RES_M))
 
@@ -88,6 +99,7 @@ def fetch_imagery(minx: float, miny: float, maxx: float, maxy: float,
             'size': f'{pw},{ph}',
             'format': 'png', 'f': 'image',
         }
+        last_error = None
         for attempt in range(retries):
             try:
                 r = requests.get(_ESRI_URL, params=params, timeout=60)
@@ -99,12 +111,24 @@ def fetch_imagery(minx: float, miny: float, maxx: float, maxy: float,
                     Image.open(io.BytesIO(r.content)).convert('RGB')
                 ).transpose(2, 0, 1)
             except Exception as exc:
-                print(f'    tile fetch retry {attempt + 1}/{retries}: {exc}')
-                time.sleep(2 ** attempt)
-        raise RuntimeError('Imagery tile fetch failed after all retries.')
+                last_error = exc
+                logger.warning(
+                    'ESRI imagery tile request failed (attempt %d/%d): %s',
+                    attempt + 1, retries, exc,
+                )
+                if attempt + 1 < retries:
+                    time.sleep(2 ** attempt)
+        raise ImageryFetchError(
+            'ESRI imagery tile request failed after all retries.'
+        ) from last_error
 
     nx = int(np.ceil(w_px / _MAX_CHUNK_PX))
     ny = int(np.ceil(h_px / _MAX_CHUNK_PX))
+    logger.info(
+        "Fetching ESRI imagery: CRS=%s bounds=(%.1f, %.1f, %.1f, %.1f), "
+        "size=%dx%d px, tiles=%d",
+        utm_crs, minx, miny, maxx, maxy, w_px, h_px, nx * ny,
+    )
     cw    = (web_maxx - web_minx) / nx
     ch    = (web_maxy - web_miny) / ny
     cw_px = int(round(w_px / nx))
@@ -127,6 +151,10 @@ def fetch_imagery(minx: float, miny: float, maxx: float, maxy: float,
         axis=2,
     )
     transform = from_bounds(minx, miny, maxx, maxy, mosaic.shape[2], mosaic.shape[1])
+    logger.info(
+        "ESRI imagery fetched: mosaic=%s, elapsed=%.1fs",
+        mosaic.shape, time.perf_counter() - started_at,
+    )
     return mosaic, transform
 
 
@@ -278,13 +306,22 @@ def extract_fields(village_feature: dict, model, device) -> dict:
     -------
     GeoJSON FeatureCollection dict (WGS84 coordinates)
     """
-    if village_feature.get('type') != 'Feature' or not village_feature.get('geometry'):
-        raise ValueError('Each village must be a GeoJSON Feature with a geometry.')
+    if (not isinstance(village_feature, dict)
+            or village_feature.get('type') != 'Feature'
+            or not village_feature.get('geometry')):
+        raise InvalidVillageGeometryError(
+            'Each village must be a GeoJSON Feature with a geometry.'
+        )
 
-    village_wgs84 = shape(village_feature['geometry'])
+    try:
+        village_wgs84 = shape(village_feature['geometry'])
+    except (TypeError, ValueError) as exc:
+        raise InvalidVillageGeometryError('Village geometry is not valid GeoJSON.') from exc
     if (village_wgs84.is_empty or not village_wgs84.is_valid
             or village_wgs84.geom_type not in ('Polygon', 'MultiPolygon')):
-        raise ValueError('Village geometry must be a valid Polygon or MultiPolygon.')
+        raise InvalidVillageGeometryError(
+            'Village geometry must be a valid Polygon or MultiPolygon.'
+        )
 
     representative_point = village_wgs84.representative_point()
     utm_crs = _utm_crs(representative_point.x, representative_point.y)
@@ -293,10 +330,17 @@ def extract_fields(village_feature: dict, model, device) -> dict:
     minx, miny, maxx, maxy = village_utm.bounds
 
     # 1. Imagery
+    logger.info('Starting imagery retrieval for village in %s.', utm_crs)
     mosaic, transform = fetch_imagery(minx, miny, maxx, maxy, utm_crs)
 
     # 2. Inference
+    inference_started_at = time.perf_counter()
+    logger.info('Running model inference on imagery mosaic %s.', mosaic.shape)
     extent_prob, boundary_prob, distance_pred = run_inference(model, mosaic, device)
+    logger.info(
+        'Model inference complete: elapsed=%.1fs',
+        time.perf_counter() - inference_started_at,
+    )
     village_mask = geometry_mask(
         [mapping(village_utm)],
         out_shape=extent_prob.shape,
@@ -306,6 +350,7 @@ def extract_fields(village_feature: dict, model, device) -> dict:
     extent_prob = np.where(village_mask, extent_prob, 0)
 
     # 3. Instances
+    logger.info('Extracting field instances from model predictions.')
     labels = extract_instances(extent_prob, boundary_prob, distance_pred)
 
     raw_polys = [
@@ -314,6 +359,7 @@ def extract_fields(village_feature: dict, model, device) -> dict:
         if v > 0
     ]
     if not raw_polys:
+        logger.info('No field instances detected inside village boundary.')
         return {'type': 'FeatureCollection', 'features': []}
 
     gdf = gpd.GeoDataFrame(
@@ -321,8 +367,10 @@ def extract_fields(village_feature: dict, model, device) -> dict:
     )
 
     # 4. Post-process
+    logger.info('Post-processing %d candidate field polygons.', len(raw_polys))
     gdf = postprocess_polygons(gdf, clip_geometry=village_utm)
     if gdf.empty:
+        logger.info('No field polygons remained after post-processing.')
         return {'type': 'FeatureCollection', 'features': []}
 
     # 5. Reproject → WGS84 and build GeoJSON
@@ -341,7 +389,7 @@ def extract_fields(village_feature: dict, model, device) -> dict:
         for _, row in gdf_wgs84.iterrows()
     ]
 
-    return {
+    result = {
         'type': 'FeatureCollection',
         'crs': {
             'type': 'name',
@@ -349,3 +397,5 @@ def extract_fields(village_feature: dict, model, device) -> dict:
         },
         'features': features,
     }
+    logger.info('Village inference complete: %d field polygons.', len(features))
+    return result

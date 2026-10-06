@@ -1,10 +1,10 @@
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class PredictRequest(BaseModel):
-    """Request body for /api/v1/predict"""
+    """Wrapped request, or raw GeoJSON normalized into this model."""
 
     geojson: dict[str, Any] | list[dict[str, Any]] = Field(
         ...,
@@ -17,6 +17,15 @@ class PredictRequest(BaseModel):
         None,
         description="Optionally process only features whose properties.taluka matches this name.",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_raw_geojson(cls, value: Any) -> Any:
+        if isinstance(value, list):
+            return {"geojson": value}
+        if isinstance(value, dict) and value.get("type") in ("Feature", "FeatureCollection"):
+            return {"geojson": value}
+        return value
 
 
 class HealthResponse(BaseModel):

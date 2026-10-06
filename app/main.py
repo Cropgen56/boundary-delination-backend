@@ -1,10 +1,17 @@
+import logging
 import torch
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 
 from app.model import load_model
-from app.inference import extract_fields
+from app.inference import (
+    ImageryFetchError,
+    InvalidVillageGeometryError,
+    extract_fields,
+)
 from app.schema import PredictRequest, HealthResponse, ErrorResponse
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Field Boundary Detection API — v2.0",
@@ -20,6 +27,7 @@ app = FastAPI(
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 model  = load_model()
 model.to(device)
+logger.info('Field boundary model loaded on %s.', device)
 
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
@@ -28,15 +36,19 @@ model.to(device)
     "/api/v1/predict",
     summary="Delineate field boundaries within village GeoJSON",
     responses={
-        200: {"description": "Per-village predictions clipped to supplied village boundaries"},
+        200: {"description": "GeoJSON FeatureCollection of predictions clipped to supplied village boundaries"},
         422: {"model": ErrorResponse, "description": "Invalid village GeoJSON"},
         404: {"model": ErrorResponse, "description": "No villages match the requested taluka"},
+        502: {"model": ErrorResponse, "description": "Imagery provider request failed"},
         500: {"model": ErrorResponse, "description": "Internal inference error"},
     },
 )
 async def predict(req: PredictRequest):
     """
     **Request body fields**
+
+    The body can be a raw GeoJSON Feature, FeatureCollection, or feature array.
+    To filter by taluka, use `{ "geojson": <GeoJSON>, "taluka": "Bhiwapur" }`.
 
     | Field | Type | Required | Default | Description |
     |-------|------|----------|---------|-------------|
@@ -58,8 +70,14 @@ async def predict(req: PredictRequest):
         else:
             raise ValueError("geojson must be a Feature, FeatureCollection, or array of Features")
 
-        if not villages or any(village.get("type") != "Feature" for village in villages):
-            raise ValueError("geojson must contain at least one GeoJSON Feature")
+        if not villages or any(
+            not isinstance(village, dict) or village.get("type") != "Feature"
+            for village in villages
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="geojson must contain at least one GeoJSON Feature",
+            )
 
         if req.taluka:
             requested_taluka = req.taluka.strip().casefold()
@@ -74,21 +92,53 @@ async def predict(req: PredictRequest):
                     detail=f"No village features found for taluka '{req.taluka}'.",
                 )
 
-        results = []
+        logger.info(
+            'Prediction request started: villages=%d, taluka=%s.',
+            len(villages), req.taluka or 'not specified',
+        )
+        predicted_features = []
         for village in villages:
             properties = village.get("properties") or {}
-            results.append({
-                "village": properties.get("name"),
-                "taluka": properties.get("taluka"),
-                "geojson": extract_fields(village, model=model, device=device),
-            })
-        return JSONResponse(content={"taluka": req.taluka, "villages": results})
+            village_name = properties.get("name", "unnamed")
+            logger.info('Starting prediction for village %s.', village_name)
+            prediction = extract_fields(village, model=model, device=device)
+            for feature in prediction.get("features", []):
+                feature_properties = dict(feature.get("properties") or {})
+                feature_properties["village"] = properties.get("name")
+                feature_properties["taluka"] = properties.get("taluka")
+                feature["properties"] = feature_properties
+                predicted_features.append(feature)
+            logger.info(
+                'Finished prediction for village %s: fields=%d.',
+                village_name, len(prediction.get('features', [])),
+            )
+        return JSONResponse(content={
+            "type": "FeatureCollection",
+            "crs": {
+                "type": "name",
+                "properties": {
+                    "name": "urn:ogc:def:crs:OGC:1.3:CRS84",
+                },
+            },
+            "features": predicted_features,
+        })
     except HTTPException:
         raise
-    except (TypeError, ValueError, KeyError) as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except InvalidVillageGeometryError as exc:
+        logger.warning('Invalid prediction request: %s', exc)
+        raise HTTPException(status_code=422, detail=f"Invalid village GeoJSON: {exc}") from exc
+    except ImageryFetchError as exc:
+        logger.exception('Imagery provider failed during prediction.')
+        raise HTTPException(
+            status_code=502,
+            detail='Unable to fetch imagery from the ESRI provider. Please try again later.',
+        ) from exc
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        logger.exception('Unexpected error during field boundary prediction.')
+        raise HTTPException(
+            status_code=500,
+            detail='Prediction failed due to an internal server error. Check server logs.',
+        ) from exc
 
 
 @app.get("/health", response_model=HealthResponse, summary="Health check")

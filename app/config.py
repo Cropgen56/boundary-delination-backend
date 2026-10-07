@@ -12,5 +12,8 @@ MIN_AREA_FRAC   = 0.10   # drop polygons below this fraction of median field are
 
 # ── Model checkpoint ──────────────────────────────────────────────────────────
 BASE_DIR        = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-# Place ft_best.pt in the checkpoints/ folder (downloaded from Drive)
-CHECKPOINT_PATH = os.path.join(BASE_DIR, "checkpoints", "ft_best.pt")
+# Place ft_best.pt in the project root (downloaded from Drive),
+# or point CHECKPOINT_PATH at it (e.g. a mounted volume in Docker)
+CHECKPOINT_PATH = os.environ.get(
+    "CHECKPOINT_PATH", os.path.join(BASE_DIR, "ft_best.pt")
+)

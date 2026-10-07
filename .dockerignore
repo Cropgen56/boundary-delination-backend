@@ -1,9 +1,16 @@
---# .dockerignore
 .venv/
 __pycache__/
 *.pyc
 .git/
+.gitignore
 .env
 .DS_Store
+.vscode/
 notebooks/
+checkpoints/
+example/
 *.nc
+*.pt
+*.pth
+Dockerfile
+docker-compose.yml

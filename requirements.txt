@@ -5,7 +5,7 @@ python-multipart
 
 # ML
 torch
-segmentation-models-pytorch
+segmentation-models-pytorch>=0.5  # UnetDecoder.forward takes a list since 0.5
 
 # Geospatial
 rasterio

@@ -1,0 +1,10 @@
+services:
+  api:
+    build: .
+    image: boundary-delineation-backend:latest
+    ports:
+      - "8000:8000"
+    volumes:
+      # ft_best.pt in the project root (downloaded from Drive), shared with local runs
+      - ./ft_best.pt:/app/checkpoints/ft_best.pt:ro
+    restart: unless-stopped

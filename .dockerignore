@@ -11,6 +11,7 @@ checkpoints/
 example/
 *.nc
 *.pt
+!ft_best.pt
 *.pth
 Dockerfile
 docker-compose.yml

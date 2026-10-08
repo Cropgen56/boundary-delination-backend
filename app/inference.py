@@ -20,17 +20,18 @@ import time
 import requests
 
 import numpy as np
+import shapely
 import torch
 import geopandas as gpd
 import pyproj
 
 from PIL import Image
 from shapely.geometry import shape, mapping, MultiPolygon
-from shapely.ops import transform as transform_geometry, unary_union
+from shapely.ops import unary_union
 from rasterio.features import geometry_mask, shapes as rio_shapes
 from rasterio.transform import from_bounds
 from skimage.segmentation import watershed
-from skimage.morphology import binary_closing, disk, remove_small_objects, h_minima
+from skimage.morphology import closing, disk, remove_small_objects, h_minima
 from skimage.filters import sobel
 from scipy import ndimage as ndi
 from scipy.ndimage import gaussian_filter
@@ -235,11 +236,12 @@ def extract_instances(extent_prob: np.ndarray, boundary_prob: np.ndarray,
     edge_smooth   = gaussian_filter(edge_strength, sigma=1.5)
 
     extent_mask = ndi.binary_fill_holes(
-        binary_closing(extent_prob > EXTENT_THRESH, disk(2))
+        closing(extent_prob > EXTENT_THRESH, disk(2))
     )
     markers, _ = ndi.label(h_minima(edge_smooth, OVERSEG_H))
     labels      = watershed(edge_smooth, markers, mask=extent_mask)
-    labels      = remove_small_objects(labels, min_size=200)
+    # max_size is inclusive, so 199 keeps the old min_size=200 behaviour
+    labels      = remove_small_objects(labels, max_size=199)
 
     return labels.astype(np.int32)
 
@@ -326,7 +328,10 @@ def extract_fields(village_feature: dict, model, device) -> dict:
     representative_point = village_wgs84.representative_point()
     utm_crs = _utm_crs(representative_point.x, representative_point.y)
     projector = pyproj.Transformer.from_crs('EPSG:4326', utm_crs, always_xy=True)
-    village_utm = transform_geometry(projector.transform, village_wgs84)
+    village_utm = shapely.transform(
+        village_wgs84,
+        lambda xy: np.column_stack(projector.transform(xy[:, 0], xy[:, 1])),
+    )
     minx, miny, maxx, maxy = village_utm.bounds
 
     # 1. Imagery

@@ -37,10 +37,10 @@ logger.info('Field boundary model loaded on %s.', device)
     summary="Delineate field boundaries within village GeoJSON",
     responses={
         200: {"description": "GeoJSON FeatureCollection of predictions clipped to supplied village boundaries"},
-        422: {"model": ErrorResponse, "description": "Invalid village GeoJSON"},
-        404: {"model": ErrorResponse, "description": "No villages match the requested taluka"},
-        502: {"model": ErrorResponse, "description": "Imagery provider request failed"},
-        500: {"model": ErrorResponse, "description": "Internal inference error"},
+        422: {"description": "Invalid village GeoJSON"},
+        404: {"description": "No villages match the requested taluka"},
+        502: {"description": "Imagery provider request failed"},
+        500: {"description": "Internal inference error"},
     },
 )
 async def predict(req: PredictRequest):

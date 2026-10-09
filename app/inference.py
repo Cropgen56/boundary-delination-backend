@@ -14,9 +14,13 @@ Pipeline
 6. Reproject UTM → WGS84, emit GeoJSON
 """
 
+import hashlib
 import io
+import json
 import logging
 import time
+from pathlib import Path
+
 import requests
 
 import numpy as np
@@ -46,7 +50,55 @@ from app.config import (
 _ESRI_URL     = ('https://services.arcgisonline.com/arcgis/rest/services/'
                  'World_Imagery/MapServer/export')
 _MAX_CHUNK_PX = 4000      # max pixels per tile request (ESRI limit)
+_CACHE_DIR = Path(__file__).resolve().parent.parent / 'data'
 logger = logging.getLogger(__name__)
+
+
+def _village_cache_key(village_geom: object) -> str:
+    """Create a stable cache filename for the village geometry."""
+    if village_geom is None:
+        raise ValueError('Village geometry is required for cache key generation.')
+    digest = hashlib.sha256(village_geom.wkb).hexdigest()
+    return digest[:32]
+
+
+def _load_cached_imagery(cache_key: str, minx: float, miny: float, maxx: float, maxy: float):
+    """Load cached ESRI imagery from the local data folder if it exists."""
+    _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_path = _CACHE_DIR / f'esri_{cache_key}.npz'
+    if not cache_path.exists():
+        return None
+
+    try:
+        payload = np.load(cache_path)
+        mosaic = payload['mosaic']
+        if mosaic.ndim != 3 or mosaic.shape[0] != 3:
+            raise ValueError('Cached imagery array is invalid.')
+        logger.info('Using cached ESRI imagery from %s.', cache_path)
+        return mosaic, from_bounds(minx, miny, maxx, maxy, mosaic.shape[2], mosaic.shape[1])
+    except Exception as exc:
+        logger.warning('Cached imagery was unreadable at %s: %s. Re-fetching from ESRI.', cache_path, exc)
+        try:
+            cache_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return None
+
+
+def _save_cached_imagery(cache_key: str, mosaic: np.ndarray, minx: float, miny: float, maxx: float, maxy: float):
+    """Persist fetched ESRI imagery in the local cache directory."""
+    _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_path = _CACHE_DIR / f'esri_{cache_key}.npz'
+    np.savez_compressed(
+        cache_path,
+        mosaic=mosaic,
+        minx=np.float64(minx),
+        miny=np.float64(miny),
+        maxx=np.float64(maxx),
+        maxy=np.float64(maxy),
+    )
+    logger.info('Saved ESRI imagery cache to %s.', cache_path)
+    return cache_path
 
 
 class ImageryFetchError(RuntimeError):
@@ -73,7 +125,7 @@ def _utm_crs(lon: float, lat: float) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def fetch_imagery(minx: float, miny: float, maxx: float, maxy: float,
-                  utm_crs: str) -> tuple[np.ndarray, object]:
+                  utm_crs: str, village_cache_key: str | None = None) -> tuple[np.ndarray, object]:
     """
     Download RGB imagery from ESRI World Imagery for a UTM bounding box.
 
@@ -82,6 +134,11 @@ def fetch_imagery(minx: float, miny: float, maxx: float, maxy: float,
     mosaic    : (3, H, W) uint8 numpy array
     transform : rasterio Affine transform (UTM coords)
     """
+    if village_cache_key:
+        cached = _load_cached_imagery(village_cache_key, minx, miny, maxx, maxy)
+        if cached is not None:
+            return cached
+
     started_at = time.perf_counter()
     w_px = int(round((maxx - minx) / RES_M))
     h_px = int(round((maxy - miny) / RES_M))
@@ -152,6 +209,8 @@ def fetch_imagery(minx: float, miny: float, maxx: float, maxy: float,
         axis=2,
     )
     transform = from_bounds(minx, miny, maxx, maxy, mosaic.shape[2], mosaic.shape[1])
+    if village_cache_key:
+        _save_cached_imagery(village_cache_key, mosaic, minx, miny, maxx, maxy)
     logger.info(
         "ESRI imagery fetched: mosaic=%s, elapsed=%.1fs",
         mosaic.shape, time.perf_counter() - started_at,
@@ -333,10 +392,11 @@ def extract_fields(village_feature: dict, model, device) -> dict:
         lambda xy: np.column_stack(projector.transform(xy[:, 0], xy[:, 1])),
     )
     minx, miny, maxx, maxy = village_utm.bounds
+    village_cache_key = _village_cache_key(village_wgs84)
 
     # 1. Imagery
     logger.info('Starting imagery retrieval for village in %s.', utm_crs)
-    mosaic, transform = fetch_imagery(minx, miny, maxx, maxy, utm_crs)
+    mosaic, transform = fetch_imagery(minx, miny, maxx, maxy, utm_crs, village_cache_key=village_cache_key)
 
     # 2. Inference
     inference_started_at = time.perf_counter()

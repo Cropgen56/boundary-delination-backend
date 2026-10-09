@@ -1,6 +1,15 @@
 # Python
 __pycache__/
 *.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+.coverage
+htmlcov/
+*.egg-info/
+build/
+dist/
 
 # ML models — never commit weights to git; download from Drive
 checkpoints/
@@ -8,8 +17,18 @@ checkpoints/
 *.pt
 example/
 
+# Local cached geospatial downloads
+data/
+
 # Environment
-.venv
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+
+# Editor settings
+.vscode/
 
 # macOS
 .DS_Store

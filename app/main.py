@@ -1,4 +1,7 @@
+import asyncio
 import logging
+from contextlib import asynccontextmanager
+
 import torch
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
@@ -13,6 +16,30 @@ from app.schema import PredictRequest, HealthResponse, ErrorResponse
 
 logger = logging.getLogger(__name__)
 
+# ── P1-3: one inference at a time — prevents GPU OOM under concurrent load ────
+_inference_semaphore = asyncio.Semaphore(1)
+
+# Module-level refs populated by lifespan (typed for static analysis)
+device: torch.device
+model:  torch.nn.Module
+
+
+# ── P1-2: lifespan replaces bare module-level load_model() call ───────────────
+# Errors here (e.g. missing checkpoint) produce a clear log message and prevent
+# the server from starting, rather than crashing mid-import with a stack trace.
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global model, device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    logger.info('Loading field boundary model on %s …', device)
+    model = load_model()
+    model.to(device)
+    logger.info('Field boundary model ready on %s.', device)
+    yield
+    # nothing to release for a pure-inference model, but the hook is here
+    # if GPU memory or other resources need explicit cleanup in future.
+
+
 app = FastAPI(
     title="Field Boundary Detection API — v2.0",
     description=(
@@ -21,13 +48,8 @@ app = FastAPI(
         "clipped to each village polygon. Multiple villages can be processed together."
     ),
     version="2.0.0",
+    lifespan=lifespan,
 )
-
-# ── Load model once at startup (critical for performance) ─────────────────────
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-model  = load_model()
-model.to(device)
-logger.info('Field boundary model loaded on %s.', device)
 
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
@@ -37,10 +59,12 @@ logger.info('Field boundary model loaded on %s.', device)
     summary="Delineate field boundaries within village GeoJSON",
     responses={
         200: {"description": "GeoJSON FeatureCollection of predictions clipped to supplied village boundaries"},
-        422: {"description": "Invalid village GeoJSON"},
-        404: {"description": "No villages match the requested taluka"},
-        502: {"description": "Imagery provider request failed"},
-        500: {"description": "Internal inference error"},
+        # P2-2: typed error responses so OpenAPI spec shows the exact error schema
+        404: {"model": ErrorResponse, "description": "No villages match the requested taluka"},
+        422: {"model": ErrorResponse, "description": "Invalid village GeoJSON or geometry too large"},
+        502: {"model": ErrorResponse, "description": "Imagery provider request failed"},
+        504: {"model": ErrorResponse, "description": "Prediction timed out — village may be too large"},
+        500: {"model": ErrorResponse, "description": "Internal inference error"},
     },
 )
 async def predict(req: PredictRequest):
@@ -68,7 +92,11 @@ async def predict(req: PredictRequest):
         elif req.geojson.get("type") == "FeatureCollection":
             villages = req.geojson.get("features", [])
         else:
-            raise ValueError("geojson must be a Feature, FeatureCollection, or array of Features")
+            # P1-4: raise 422 directly — ValueError fell through to the 500 handler
+            raise HTTPException(
+                status_code=422,
+                detail="geojson must be a Feature, FeatureCollection, or array of Features",
+            )
 
         if not villages or any(
             not isinstance(village, dict) or village.get("type") != "Feature"
@@ -101,7 +129,28 @@ async def predict(req: PredictRequest):
             properties = village.get("properties") or {}
             village_name = properties.get("name", "unnamed")
             logger.info('Starting prediction for village %s.', village_name)
-            prediction = extract_fields(village, model=model, device=device)
+            # P0:  asyncio.to_thread → blocking work off the event loop
+            # P1-1: asyncio.wait_for → hard 5-minute cap per village (HTTP 504)
+            # P1-3: _inference_semaphore → one GPU/CPU inference at a time
+            try:
+                async with _inference_semaphore:
+                    prediction = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            extract_fields, village, model=model, device=device
+                        ),
+                        timeout=300,  # seconds — override via P1-1 config if needed
+                    )
+            except asyncio.TimeoutError:
+                logger.error(
+                    'Prediction timed out for village %s after 300 s.', village_name
+                )
+                raise HTTPException(
+                    status_code=504,
+                    detail=(
+                        f"Prediction for village '{village_name}' timed out. "
+                        "The village may be too large — try splitting it."
+                    ),
+                )
             for feature in prediction.get("features", []):
                 feature_properties = dict(feature.get("properties") or {})
                 feature_properties["village"] = properties.get("name")

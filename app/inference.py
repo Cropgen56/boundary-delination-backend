@@ -44,6 +44,7 @@ from app.config import (
     PATCH_PX, RES_M,
     OVERSEG_H, EXTENT_THRESH,
     SIMPLIFY_TOL_M, DAGGER_WIDTH_M, MIN_AREA_FRAC,
+    MAX_BBOX_KM2, CACHE_MAX_GB,
 )
 
 # ── ESRI World Imagery tile server ────────────────────────────────────────────
@@ -86,7 +87,8 @@ def _load_cached_imagery(cache_key: str, minx: float, miny: float, maxx: float, 
 
 
 def _save_cached_imagery(cache_key: str, mosaic: np.ndarray, minx: float, miny: float, maxx: float, maxy: float):
-    """Persist fetched ESRI imagery in the local cache directory."""
+    """Persist fetched ESRI imagery and evict oldest files when the cache
+    directory exceeds CACHE_MAX_GB total on-disk size."""
     _CACHE_DIR.mkdir(parents=True, exist_ok=True)
     cache_path = _CACHE_DIR / f'esri_{cache_key}.npz'
     np.savez_compressed(
@@ -98,6 +100,31 @@ def _save_cached_imagery(cache_key: str, mosaic: np.ndarray, minx: float, miny: 
         maxy=np.float64(maxy),
     )
     logger.info('Saved ESRI imagery cache to %s.', cache_path)
+
+    # ── P2-1: LRU eviction ───────────────────────────────────────────────────────
+    if CACHE_MAX_GB <= 0:
+        return cache_path   # eviction disabled
+
+    limit_bytes = CACHE_MAX_GB * 1024 ** 3
+    entries = sorted(
+        _CACHE_DIR.glob('esri_*.npz'),
+        key=lambda p: p.stat().st_mtime,   # oldest first
+    )
+    total = sum(p.stat().st_size for p in entries)
+    while total > limit_bytes and entries:
+        oldest = entries.pop(0)
+        freed = oldest.stat().st_size
+        try:
+            oldest.unlink()
+            total -= freed
+            logger.info(
+                'Cache eviction: deleted %s (freed %.1f MB, total now %.1f MB).',
+                oldest.name, freed / 1024**2, total / 1024**2,
+            )
+        except OSError as exc:
+            logger.warning('Cache eviction failed for %s: %s', oldest.name, exc)
+            break
+
     return cache_path
 
 
@@ -287,7 +314,10 @@ def extract_instances(extent_prob: np.ndarray, boundary_prob: np.ndarray,
 
     Returns label array (H, W) int32 — 0 = background.
     """
-    dist_norm   = (distance_pred - distance_pred.min()) / (np.ptp(distance_pred) + 1e-9)
+    # P2-3: np.ptp() was removed in NumPy 2.0 — use explicit max-min instead
+    dist_norm   = (distance_pred - distance_pred.min()) / (
+        (distance_pred.max() - distance_pred.min()) + 1e-9
+    )
     dist_edges  = sobel(gaussian_filter(dist_norm, sigma=1.0))
     dist_edges /= (dist_edges.max() + 1e-9)
 
@@ -392,6 +422,16 @@ def extract_fields(village_feature: dict, model, device) -> dict:
         lambda xy: np.column_stack(projector.transform(xy[:, 0], xy[:, 1])),
     )
     minx, miny, maxx, maxy = village_utm.bounds
+
+    # ── P0 guard: reject inputs whose bounding box would cause OOM ──────────
+    area_km2 = (maxx - minx) * (maxy - miny) / 1e6
+    if area_km2 > MAX_BBOX_KM2:
+        raise InvalidVillageGeometryError(
+            f'Village bounding box ({area_km2:.1f} km²) exceeds the '
+            f'maximum allowed area of {MAX_BBOX_KM2:.0f} km². '
+            'Split the village into smaller tiles and retry.'
+        )
+
     village_cache_key = _village_cache_key(village_wgs84)
 
     # 1. Imagery

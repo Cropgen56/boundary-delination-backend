@@ -383,20 +383,29 @@ def postprocess_polygons(gdf: gpd.GeoDataFrame, clip_geometry=None) -> gpd.GeoDa
 # Public entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
-def extract_fields(village_feature: dict, model, device) -> dict:
+def extract_fields(village_feature: dict, model, device,
+                   progress_callback=None) -> dict:
     """
     End-to-end field boundary extraction.
 
     Parameters
     ----------
-    village_feature : GeoJSON Feature with a Polygon or MultiPolygon in WGS84
-    model      : loaded TripleHeadModel
-    device     : torch.device
+    village_feature   : GeoJSON Feature with a Polygon or MultiPolygon in WGS84
+    model             : loaded TripleHeadModel
+    device            : torch.device
+    progress_callback : optional callable(step: str, message: str, pct: int)
+                        called at every major pipeline stage for live UI updates.
 
     Returns
     -------
     GeoJSON FeatureCollection dict (WGS84 coordinates)
     """
+    def _emit(step: str, message: str, pct: int = 0):
+        if progress_callback:
+            try:
+                progress_callback(step, message, pct)
+            except Exception:
+                pass  # never let UI callbacks crash inference
     if (not isinstance(village_feature, dict)
             or village_feature.get('type') != 'Feature'
             or not village_feature.get('geometry')):
@@ -404,6 +413,7 @@ def extract_fields(village_feature: dict, model, device) -> dict:
             'Each village must be a GeoJSON Feature with a geometry.'
         )
 
+    _emit('geometry', 'Validating village geometry …', 5)
     try:
         village_wgs84 = shape(village_feature['geometry'])
     except (TypeError, ValueError) as exc:
@@ -422,7 +432,6 @@ def extract_fields(village_feature: dict, model, device) -> dict:
         lambda xy: np.column_stack(projector.transform(xy[:, 0], xy[:, 1])),
     )
     minx, miny, maxx, maxy = village_utm.bounds
-
     # ── P0 guard: reject inputs whose bounding box would cause OOM ──────────
     area_km2 = (maxx - minx) * (maxy - miny) / 1e6
     if area_km2 > MAX_BBOX_KM2:
@@ -435,10 +444,12 @@ def extract_fields(village_feature: dict, model, device) -> dict:
     village_cache_key = _village_cache_key(village_wgs84)
 
     # 1. Imagery
+    _emit('imagery', 'Fetching RGB imagery from ESRI World Imagery …', 15)
     logger.info('Starting imagery retrieval for village in %s.', utm_crs)
     mosaic, transform = fetch_imagery(minx, miny, maxx, maxy, utm_crs, village_cache_key=village_cache_key)
 
     # 2. Inference
+    _emit('inference', 'Running sliding-window model inference …', 40)
     inference_started_at = time.perf_counter()
     logger.info('Running model inference on imagery mosaic %s.', mosaic.shape)
     extent_prob, boundary_prob, distance_pred = run_inference(model, mosaic, device)
@@ -446,6 +457,7 @@ def extract_fields(village_feature: dict, model, device) -> dict:
         'Model inference complete: elapsed=%.1fs',
         time.perf_counter() - inference_started_at,
     )
+    _emit('masking', 'Applying village boundary mask …', 58)
     village_mask = geometry_mask(
         [mapping(village_utm)],
         out_shape=extent_prob.shape,
@@ -455,6 +467,7 @@ def extract_fields(village_feature: dict, model, device) -> dict:
     extent_prob = np.where(village_mask, extent_prob, 0)
 
     # 3. Instances
+    _emit('watershed', 'Extracting field instances via h-minima watershed …', 65)
     logger.info('Extracting field instances from model predictions.')
     labels = extract_instances(extent_prob, boundary_prob, distance_pred)
 
@@ -465,6 +478,7 @@ def extract_fields(village_feature: dict, model, device) -> dict:
     ]
     if not raw_polys:
         logger.info('No field instances detected inside village boundary.')
+        _emit('complete', 'Done — no field instances detected.', 100)
         return {'type': 'FeatureCollection', 'features': []}
 
     gdf = gpd.GeoDataFrame(
@@ -472,13 +486,16 @@ def extract_fields(village_feature: dict, model, device) -> dict:
     )
 
     # 4. Post-process
+    _emit('postprocess', f'Post-processing {len(raw_polys)} candidate polygons …', 78)
     logger.info('Post-processing %d candidate field polygons.', len(raw_polys))
     gdf = postprocess_polygons(gdf, clip_geometry=village_utm)
     if gdf.empty:
         logger.info('No field polygons remained after post-processing.')
+        _emit('complete', 'Done — all polygons filtered out in post-processing.', 100)
         return {'type': 'FeatureCollection', 'features': []}
 
     # 5. Reproject → WGS84 and build GeoJSON
+    _emit('reproject', 'Reprojecting UTM → WGS84 and building GeoJSON …', 90)
     gdf_wgs84 = gdf.to_crs('EPSG:4326')
     features = [
         {
@@ -503,4 +520,5 @@ def extract_fields(village_feature: dict, model, device) -> dict:
         'features': features,
     }
     logger.info('Village inference complete: %d field polygons.', len(features))
+    _emit('complete', f'Done — {len(features)} field polygons detected.', 100)
     return result

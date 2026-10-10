@@ -22,8 +22,8 @@ CACHE_MAX_GB    = float(os.environ.get('CACHE_MAX_GB', 5))    # gigabytes
 
 # ── Model checkpoint ──────────────────────────────────────────────────────────
 BASE_DIR        = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-# Place ft_best.pt in the project root (downloaded from Drive),
+# Place ft_best.pt in the checkpoints directory,
 # or point CHECKPOINT_PATH at it (e.g. a mounted volume in Docker)
 CHECKPOINT_PATH = os.environ.get(
-    "CHECKPOINT_PATH", os.path.join(BASE_DIR, "ft_best.pt")
+    "CHECKPOINT_PATH", os.path.join(BASE_DIR, "checkpoints", "ft_best.pt")
 )

@@ -1,0 +1,670 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CropGen — Field Boundary Detector</title>
+
+  <!-- Leaflet -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <!-- Google Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+
+  <style>
+    /* ── Reset & Tokens ─────────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:        #080d18;
+      --surface:   #0e1624;
+      --surface2:  #151f30;
+      --border:    #1e2d42;
+      --green:     #22c55e;
+      --green-dim: #16a34a;
+      --blue:      #3b82f6;
+      --amber:     #f59e0b;
+      --red:       #ef4444;
+      --text:      #e2e8f0;
+      --muted:     #64748b;
+      --radius:    10px;
+      --panel-w:   420px;
+      --font:      'Inter', system-ui, sans-serif;
+      --mono:      'JetBrains Mono', monospace;
+    }
+
+    html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(--text); font-family: var(--font); }
+
+    /* ── Layout ─────────────────────────────────────────────────────── */
+    #app { display: flex; height: 100vh; }
+
+    #map-wrap {
+      flex: 1;
+      position: relative;
+      border-right: 1px solid var(--border);
+    }
+    #map { width: 100%; height: 100%; }
+
+    /* Leaflet dark overrides */
+    .leaflet-container { background: #0a0e1a; }
+    .leaflet-control-zoom a { background: var(--surface2) !important; color: var(--text) !important; border-color: var(--border) !important; }
+    .leaflet-control-attribution { background: rgba(8,13,24,0.8) !important; color: var(--muted) !important; font-size: 10px; }
+
+    /* map badge */
+    #map-badge {
+      position: absolute; bottom: 14px; left: 14px; z-index: 999;
+      background: rgba(8,13,24,0.85); backdrop-filter: blur(8px);
+      border: 1px solid var(--border); border-radius: var(--radius);
+      padding: 8px 14px; font-size: 12px; color: var(--muted);
+      pointer-events: none;
+    }
+    #map-badge span { color: var(--green); font-weight: 600; }
+
+    /* ── Right Panel ─────────────────────────────────────────────────── */
+    #panel {
+      width: var(--panel-w);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      background: var(--surface);
+    }
+
+    /* Header */
+    #header {
+      padding: 18px 20px 16px;
+      border-bottom: 1px solid var(--border);
+      background: var(--surface);
+    }
+    .logo { display: flex; align-items: center; gap: 10px; margin-bottom: 4px; }
+    .logo-icon {
+      width: 34px; height: 34px; border-radius: 8px;
+      background: linear-gradient(135deg, #16a34a, #3b82f6);
+      display: flex; align-items: center; justify-content: center;
+      font-size: 18px; flex-shrink: 0;
+    }
+    .logo-text { font-size: 17px; font-weight: 700; letter-spacing: -0.3px; }
+    .logo-sub { font-size: 11px; color: var(--muted); margin-top: 1px; }
+    .tag {
+      display: inline-block; font-size: 10px; font-weight: 600;
+      background: rgba(34,197,94,0.12); color: var(--green);
+      border: 1px solid rgba(34,197,94,0.3); border-radius: 4px;
+      padding: 2px 7px; letter-spacing: 0.5px; margin-top: 6px;
+    }
+
+    /* Scrollable body */
+    #panel-body { flex: 1; overflow-y: auto; padding: 16px 20px; display: flex; flex-direction: column; gap: 14px; }
+    #panel-body::-webkit-scrollbar { width: 4px; }
+    #panel-body::-webkit-scrollbar-track { background: transparent; }
+    #panel-body::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+    /* Village card */
+    .card {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 14px;
+    }
+    .card-title { font-size: 11px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.8px; margin-bottom: 10px; }
+    .village-info { display: flex; align-items: center; gap: 10px; }
+    .village-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--amber); flex-shrink: 0; }
+    .village-name { font-size: 14px; font-weight: 600; }
+    .village-meta { font-size: 12px; color: var(--muted); margin-top: 2px; }
+
+    /* File loader */
+    #drop-zone {
+      border: 2px dashed var(--border);
+      border-radius: var(--radius);
+      padding: 20px;
+      text-align: center;
+      cursor: pointer;
+      transition: border-color .2s, background .2s;
+    }
+    #drop-zone:hover, #drop-zone.drag { border-color: var(--green); background: rgba(34,197,94,0.04); }
+    #drop-zone .dz-icon { font-size: 26px; margin-bottom: 6px; }
+    #drop-zone .dz-label { font-size: 13px; color: var(--muted); }
+    #drop-zone .dz-label strong { color: var(--text); }
+    #file-input { display: none; }
+
+    /* Run button */
+    #run-btn {
+      width: 100%; padding: 13px;
+      background: linear-gradient(135deg, var(--green-dim), #15803d);
+      color: #fff; font-family: var(--font); font-size: 14px; font-weight: 600;
+      border: none; border-radius: var(--radius); cursor: pointer;
+      display: flex; align-items: center; justify-content: center; gap: 8px;
+      transition: opacity .2s, transform .1s;
+      letter-spacing: 0.2px;
+    }
+    #run-btn:hover:not(:disabled) { opacity: .88; transform: translateY(-1px); }
+    #run-btn:active:not(:disabled) { transform: translateY(0); }
+    #run-btn:disabled { opacity: .4; cursor: not-allowed; transform: none; }
+
+    /* Overall progress bar */
+    .progress-wrap { background: var(--border); border-radius: 99px; height: 6px; overflow: hidden; }
+    .progress-bar {
+      height: 100%; border-radius: 99px;
+      background: linear-gradient(90deg, var(--green-dim), var(--green));
+      width: 0%; transition: width .5s cubic-bezier(.4,0,.2,1);
+    }
+    .progress-label { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); margin-bottom: 6px; }
+
+    /* Pipeline steps */
+    .steps-list { display: flex; flex-direction: column; gap: 6px; }
+
+    .step {
+      display: flex; align-items: flex-start; gap: 11px;
+      padding: 10px 12px; border-radius: 8px;
+      border: 1px solid transparent;
+      transition: background .2s, border-color .2s;
+      opacity: 0.45;
+    }
+    .step.active  { background: rgba(59,130,246,0.08); border-color: rgba(59,130,246,0.25); opacity: 1; }
+    .step.done    { background: rgba(34,197,94,0.06);  border-color: rgba(34,197,94,0.2);   opacity: 1; }
+    .step.error   { background: rgba(239,68,68,0.08);  border-color: rgba(239,68,68,0.25);  opacity: 1; }
+    .step.pending { opacity: 0.35; }
+
+    .step-icon {
+      width: 28px; height: 28px; border-radius: 6px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 14px; flex-shrink: 0;
+      background: var(--border);
+      transition: background .2s;
+    }
+    .step.active .step-icon  { background: rgba(59,130,246,0.2); }
+    .step.done   .step-icon  { background: rgba(34,197,94,0.15); }
+    .step.error  .step-icon  { background: rgba(239,68,68,0.15); }
+
+    .step-body { flex: 1; min-width: 0; }
+    .step-name { font-size: 12px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .step.active .step-name { color: #93c5fd; }
+    .step.done   .step-name { color: var(--green); }
+    .step.error  .step-name { color: #fca5a5; }
+
+    .step-msg { font-size: 11px; color: var(--muted); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+    .step-badge {
+      font-size: 9px; font-weight: 700; padding: 2px 6px; border-radius: 4px;
+      background: var(--border); color: var(--muted); flex-shrink: 0;
+      font-family: var(--mono); letter-spacing: 0.5px; align-self: center;
+    }
+    .step.active .step-badge { background: rgba(59,130,246,0.2); color: #93c5fd; }
+    .step.done   .step-badge { background: rgba(34,197,94,0.15); color: var(--green); }
+
+    /* Spinner */
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .spinner {
+      width: 13px; height: 13px; border: 2px solid rgba(147,197,253,0.3);
+      border-top-color: #93c5fd; border-radius: 50%;
+      animation: spin .7s linear infinite; display: inline-block; flex-shrink: 0;
+    }
+
+    /* Stats grid */
+    .stats-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .stat {
+      background: var(--bg); border: 1px solid var(--border);
+      border-radius: 8px; padding: 12px;
+    }
+    .stat-val { font-size: 22px; font-weight: 700; line-height: 1; color: var(--green); }
+    .stat-lbl { font-size: 11px; color: var(--muted); margin-top: 4px; }
+
+    /* Log */
+    #log {
+      background: var(--bg); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 10px 12px;
+      font-family: var(--mono); font-size: 11px; color: var(--muted);
+      max-height: 110px; overflow-y: auto; line-height: 1.7;
+    }
+    #log::-webkit-scrollbar { width: 3px; }
+    #log::-webkit-scrollbar-thumb { background: var(--border); }
+    .log-line { display: block; }
+    .log-line.ok  { color: var(--green); }
+    .log-line.err { color: #f87171; }
+    .log-line.inf { color: #93c5fd; }
+
+    /* Footer */
+    #footer {
+      padding: 10px 20px;
+      border-top: 1px solid var(--border);
+      font-size: 11px; color: var(--muted);
+      display: flex; justify-content: space-between; align-items: center;
+    }
+    #status-dot {
+      width: 7px; height: 7px; border-radius: 50%;
+      background: var(--muted); display: inline-block; margin-right: 5px;
+      transition: background .3s;
+    }
+    #status-dot.live { background: var(--green); box-shadow: 0 0 6px var(--green); }
+    #status-dot.err  { background: var(--red); }
+
+    /* Pulse animation for active step icon */
+    @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:.5; } }
+    .pulsing { animation: pulse 1.4s ease-in-out infinite; }
+
+    /* ── Responsive ──────────────────────────────────────────────────── */
+    @media (max-width: 768px) {
+      #app { flex-direction: column; }
+      #map-wrap { flex: 0 0 45vh; border-right: none; border-bottom: 1px solid var(--border); }
+      #panel { width: 100%; }
+    }
+  </style>
+</head>
+<body>
+<div id="app">
+
+  <!-- ── Map ──────────────────────────────────────────────────────────── -->
+  <div id="map-wrap">
+    <div id="map"></div>
+    <div id="map-badge">Fields detected: <span id="badge-count">—</span></div>
+  </div>
+
+  <!-- ── Panel ─────────────────────────────────────────────────────────── -->
+  <div id="panel">
+    <div id="header">
+      <div class="logo">
+        <div class="logo-icon">🌾</div>
+        <div>
+          <div class="logo-text">CropGen</div>
+          <div class="logo-sub">Field Boundary Detection API v2.0</div>
+        </div>
+      </div>
+      <span class="tag">EfficientNet-B4 UNet · Triple-Head</span>
+    </div>
+
+    <div id="panel-body">
+
+      <!-- Village info -->
+      <div class="card" id="village-card" style="display:none">
+        <div class="card-title">Village</div>
+        <div class="village-info">
+          <div class="village-dot"></div>
+          <div>
+            <div class="village-name" id="vname">—</div>
+            <div class="village-meta" id="vmeta">—</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- File drop zone -->
+      <div id="drop-zone" onclick="document.getElementById('file-input').click()">
+        <input type="file" id="file-input" accept=".geojson,.json" />
+        <div class="dz-icon">📂</div>
+        <div class="dz-label"><strong>Drop a GeoJSON file</strong> or click to browse</div>
+      </div>
+
+      <!-- Run -->
+      <button id="run-btn" disabled onclick="runInference()">
+        <span id="btn-icon">🚀</span>
+        <span id="btn-label">Run Inference</span>
+      </button>
+
+      <!-- Progress -->
+      <div id="progress-section" style="display:none">
+        <div class="card-title" style="margin-bottom:8px">Overall Progress</div>
+        <div class="progress-label">
+          <span id="stage-label">Initialising…</span>
+          <span id="pct-label">0%</span>
+        </div>
+        <div class="progress-wrap"><div class="progress-bar" id="prog-bar"></div></div>
+      </div>
+
+      <!-- Pipeline steps -->
+      <div id="steps-section" style="display:none">
+        <div class="card-title" style="margin-bottom:8px">Pipeline</div>
+        <div class="steps-list" id="steps-list"></div>
+      </div>
+
+      <!-- Stats -->
+      <div id="stats-section" style="display:none">
+        <div class="card-title" style="margin-bottom:8px">Results</div>
+        <div class="stats-grid">
+          <div class="stat"><div class="stat-val" id="s-fields">—</div><div class="stat-lbl">Fields detected</div></div>
+          <div class="stat"><div class="stat-val" id="s-area">—</div><div class="stat-lbl">Total area (ha)</div></div>
+          <div class="stat"><div class="stat-val" id="s-avg">—</div><div class="stat-lbl">Avg field size (ha)</div></div>
+          <div class="stat"><div class="stat-val" id="s-device">—</div><div class="stat-lbl">Compute device</div></div>
+        </div>
+      </div>
+
+      <!-- Log -->
+      <div>
+        <div class="card-title" style="margin-bottom:6px">Event log</div>
+        <div id="log"><span class="log-line">Ready. Load a GeoJSON file to begin.</span></div>
+      </div>
+
+    </div><!-- panel-body -->
+
+    <div id="footer">
+      <div><span id="status-dot"></span><span id="status-txt">Idle</span></div>
+      <div id="api-url">http://localhost:8080</div>
+    </div>
+  </div>
+</div>
+
+<script>
+/* ── Config ─────────────────────────────────────────────────────────────── */
+const API = window.location.origin;
+
+/* ── Map setup ──────────────────────────────────────────────────────────── */
+const map = L.map('map', { zoomControl: true, attributionControl: true })
+  .setView([20.77, 77.17], 13);
+
+L.tileLayer(
+  'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+  { attribution: 'Tiles © Esri', maxZoom: 19 }
+).addTo(map);
+
+let villageLayer = null;
+let resultLayer  = null;
+
+/* ── State ───────────────────────────────────────────────────────────────── */
+let loadedGeoJSON = null;
+
+/* ── Pipeline step definitions ───────────────────────────────────────────── */
+const STEPS = [
+  { key: 'geometry',   icon: '📋', label: 'Validate geometry' },
+  { key: 'imagery',    icon: '🛰️',  label: 'Fetch ESRI imagery' },
+  { key: 'inference',  icon: '🤖', label: 'Model inference' },
+  { key: 'masking',    icon: '🎭', label: 'Apply village mask' },
+  { key: 'watershed',  icon: '🌊', label: 'Watershed segmentation' },
+  { key: 'postprocess',icon: '✂️',  label: 'Post-process polygons' },
+  { key: 'reproject',  icon: '📍', label: 'Reproject → WGS84' },
+  { key: 'complete',   icon: '✅', label: 'Complete' },
+];
+
+/* ── UI helpers ─────────────────────────────────────────────────────────── */
+const $ = id => document.getElementById(id);
+
+function setStatus(txt, live = false, err = false) {
+  $('status-txt').textContent = txt;
+  $('status-dot').className = live ? 'live' : err ? 'err' : '';
+}
+
+function log(msg, cls = '') {
+  const el = $('log');
+  const line = document.createElement('span');
+  line.className = 'log-line' + (cls ? ` ${cls}` : '');
+  line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+  el.appendChild(document.createElement('br'));
+  el.appendChild(line);
+  el.scrollTop = el.scrollHeight;
+}
+
+function setProgress(pct, label) {
+  $('prog-bar').style.width = pct + '%';
+  $('pct-label').textContent = pct + '%';
+  if (label) $('stage-label').textContent = label;
+}
+
+function buildSteps() {
+  const list = $('steps-list');
+  list.innerHTML = '';
+  STEPS.forEach(s => {
+    const el = document.createElement('div');
+    el.className = 'step pending';
+    el.id = 'step-' + s.key;
+    el.innerHTML = `
+      <div class="step-icon">${s.icon}</div>
+      <div class="step-body">
+        <div class="step-name">${s.label}</div>
+        <div class="step-msg" id="step-msg-${s.key}">Waiting…</div>
+      </div>
+      <div class="step-badge" id="step-badge-${s.key}">WAIT</div>`;
+    list.appendChild(el);
+  });
+}
+
+function activateStep(key, msg) {
+  // mark previous active step as done
+  STEPS.forEach(s => {
+    const el = $('step-' + s.key);
+    if (el && el.classList.contains('active')) {
+      el.classList.remove('active');
+      el.classList.add('done');
+      $('step-badge-' + s.key).textContent = 'DONE';
+    }
+  });
+  const el = $('step-' + key);
+  if (!el) return;
+  el.classList.remove('pending', 'done', 'error');
+  el.classList.add('active');
+  if (msg) $('step-msg-' + key).textContent = msg;
+  $('step-badge-' + key).innerHTML = '<div class="spinner"></div>';
+}
+
+function doneStep(key) {
+  const el = $('step-' + key);
+  if (!el) return;
+  el.classList.remove('active', 'pending', 'error');
+  el.classList.add('done');
+  $('step-badge-' + key).textContent = 'DONE';
+}
+
+function errorStep(key) {
+  const el = $('step-' + key);
+  if (!el) return;
+  el.classList.remove('active', 'pending', 'done');
+  el.classList.add('error');
+  $('step-badge-' + key).textContent = 'ERR';
+}
+
+/* ── GeoJSON loading ─────────────────────────────────────────────────────── */
+function loadGeoJSON(geojson) {
+  loadedGeoJSON = geojson;
+
+  // Draw village boundary
+  if (villageLayer) map.removeLayer(villageLayer);
+  if (resultLayer)  { map.removeLayer(resultLayer); resultLayer = null; }
+
+  villageLayer = L.geoJSON(geojson, {
+    style: { color: '#f59e0b', weight: 2.5, fillOpacity: 0.08, dashArray: '6 4' }
+  }).addTo(map);
+  map.fitBounds(villageLayer.getBounds(), { padding: [30, 30] });
+
+  // Update village card
+  const props = geojson.properties || {};
+  const name  = props.name || props.Name || props.village || 'Unknown';
+  const meta  = [props.taluka, props.district, props.state].filter(Boolean).join(' · ') || 'No metadata';
+  $('vname').textContent = name;
+  $('vmeta').textContent = meta;
+  $('village-card').style.display = '';
+
+  // Count coordinates
+  const coords = geojson.geometry?.coordinates?.[0] || [];
+  log(`Loaded: ${name} — ${coords.length} vertices`, 'inf');
+
+  $('run-btn').disabled = false;
+  $('drop-zone').querySelector('.dz-icon').textContent = '✅';
+  $('drop-zone').querySelector('.dz-label').innerHTML =
+    `<strong>${name}</strong> loaded · click to replace`;
+}
+
+function handleFile(file) {
+  const reader = new FileReader();
+  reader.onload = e => {
+    try {
+      loadGeoJSON(JSON.parse(e.target.result));
+    } catch {
+      log('Invalid JSON file', 'err');
+    }
+  };
+  reader.readAsText(file);
+}
+
+// Drag & drop
+const dz = $('drop-zone');
+dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('drag'); });
+dz.addEventListener('dragleave', () => dz.classList.remove('drag'));
+dz.addEventListener('drop', e => { e.preventDefault(); dz.classList.remove('drag'); handleFile(e.dataTransfer.files[0]); });
+$('file-input').addEventListener('change', e => handleFile(e.target.files[0]));
+
+/* ── Health check ────────────────────────────────────────────────────────── */
+async function checkHealth() {
+  try {
+    const r = await fetch(`${API}/health`);
+    if (!r.ok) throw new Error(r.status);
+    const d = await r.json();
+    $('s-device').textContent = d.device || '—';
+    $('api-url').textContent  = `${API} · ${d.device}`;
+    setStatus('API ready', true);
+    log(`Server online — device: ${d.device}`, 'ok');
+  } catch {
+    setStatus('API offline', false, true);
+    log('Cannot reach API at ' + API, 'err');
+  }
+}
+checkHealth();
+
+/* ── Draw result polygons ────────────────────────────────────────────────── */
+function drawResult(fc) {
+  if (resultLayer) map.removeLayer(resultLayer);
+  resultLayer = L.geoJSON(fc, {
+    style: () => ({
+      color: '#22c55e',
+      weight: 1.5,
+      fillColor: '#4ade80',
+      fillOpacity: 0.22,
+    }),
+    onEachFeature: (feat, layer) => {
+      const p = feat.properties || {};
+      layer.bindPopup(`
+        <div style="font-family:Inter,sans-serif;font-size:12px;min-width:160px">
+          <b style="color:#22c55e">Field #${p.field_id ?? '?'}</b>
+          <table style="margin-top:6px;width:100%;border-collapse:collapse">
+            <tr><td style="color:#888;padding:2px 0">Area</td><td style="text-align:right;font-weight:600">${p.area_ha ?? '?'} ha</td></tr>
+            <tr><td style="color:#888;padding:2px 0">Perimeter</td><td style="text-align:right">${p.perimeter_m ?? '?'} m</td></tr>
+            ${p.village ? `<tr><td style="color:#888;padding:2px 0">Village</td><td style="text-align:right">${p.village}</td></tr>` : ''}
+          </table>
+        </div>
+      `);
+      layer.on('mouseover', () => layer.setStyle({ fillOpacity: 0.5, weight: 2.5 }));
+      layer.on('mouseout',  () => resultLayer.resetStyle(layer));
+    }
+  }).addTo(map);
+
+  // Compute stats
+  const feats    = fc.features || [];
+  const total_ha = feats.reduce((s, f) => s + (f.properties?.area_ha || 0), 0);
+  const avg_ha   = feats.length ? (total_ha / feats.length) : 0;
+  $('s-fields').textContent = feats.length;
+  $('s-area').textContent   = total_ha.toFixed(2);
+  $('s-avg').textContent    = avg_ha.toFixed(2);
+  $('badge-count').textContent = feats.length;
+  $('stats-section').style.display = '';
+}
+
+/* ── Run inference via SSE ───────────────────────────────────────────────── */
+async function runInference() {
+  if (!loadedGeoJSON) return;
+
+  // Reset UI
+  $('run-btn').disabled = true;
+  $('btn-icon').textContent = '⏳';
+  $('btn-label').textContent = 'Running…';
+  $('stats-section').style.display = 'none';
+  $('progress-section').style.display = '';
+  $('steps-section').style.display = '';
+  if (resultLayer) { map.removeLayer(resultLayer); resultLayer = null; }
+  $('badge-count').textContent = '—';
+  buildSteps();
+  setProgress(0, 'Connecting…');
+  setStatus('Streaming', true);
+  log('Starting SSE inference stream…', 'inf');
+
+  try {
+    const resp = await fetch(`${API}/api/v1/predict/stream`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ geojson: loadedGeoJSON }),
+    });
+
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({ detail: resp.statusText }));
+      throw new Error(`HTTP ${resp.status}: ${err.detail}`);
+    }
+
+    const reader = resp.body.getReader();
+    const dec    = new TextDecoder();
+    let   buf    = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buf += dec.decode(value, { stream: true });
+      const lines = buf.split('\n');
+      buf = lines.pop();  // keep incomplete line
+
+      for (const line of lines) {
+        if (!line.startsWith('data:')) continue;
+        let ev;
+        try { ev = JSON.parse(line.slice(5).trim()); } catch { continue; }
+        handleEvent(ev);
+      }
+    }
+
+  } catch (e) {
+    log('Error: ' + e.message, 'err');
+    setStatus('Error', false, true);
+  } finally {
+    $('run-btn').disabled = false;
+    $('btn-icon').textContent = '🚀';
+    $('btn-label').textContent = 'Run Inference';
+  }
+}
+
+function handleEvent(ev) {
+  switch (ev.type) {
+
+    case 'start':
+      log(`Pipeline started — ${ev.village_count} village(s)`, 'inf');
+      setProgress(2, 'Starting pipeline…');
+      break;
+
+    case 'village_start':
+      log(`▶ Village: ${ev.name}`);
+      setProgress(5, ev.name);
+      break;
+
+    case 'progress': {
+      activateStep(ev.step, ev.message);
+      setProgress(ev.pct, ev.message);
+      log(ev.message);
+      if (ev.step === 'complete') doneStep('complete');
+      break;
+    }
+
+    case 'village_done':
+      log(`✅ ${ev.name} — ${ev.field_count} field(s) detected`, 'ok');
+      setProgress(95, 'Finalising…');
+      // mark any remaining active step as done
+      STEPS.forEach(s => {
+        const el = $('step-' + s.key);
+        if (el && el.classList.contains('active')) doneStep(s.key);
+      });
+      break;
+
+    case 'result':
+      drawResult(ev.geojson);
+      setProgress(100, 'Complete');
+      setStatus('Done', true);
+      log(`🎉 Inference complete — ${ev.geojson.features?.length ?? 0} fields drawn on map`, 'ok');
+      break;
+
+    case 'error':
+      log('Error: ' + ev.detail, 'err');
+      setStatus('Error', false, true);
+      // mark the last active step as errored
+      STEPS.forEach(s => {
+        const el = $('step-' + s.key);
+        if (el && el.classList.contains('active')) errorStep(s.key);
+      });
+      break;
+
+    default:
+      break;
+  }
+}
+</script>
+</body>
+</html>

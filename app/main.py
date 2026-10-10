@@ -67,10 +67,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Serve the test UI and example GeoJSON
+# Serve the tracked web UI and bundled example GeoJSON
 import os
-example_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "example")
-app.mount("/ui", StaticFiles(directory=example_dir), name="ui")
+base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ui_dir = os.path.join(base_dir, "ui")
+app.mount("/ui", StaticFiles(directory=ui_dir, html=True), name="ui")
+
+
+@app.get("/", include_in_schema=False)
+async def root_redirect():
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url="/ui/")
 
 
 # ── Shared helpers ────────────────────────────────────────────────────────────────
@@ -125,9 +132,24 @@ def _sse_json(data: dict) -> str:
 @app.post(
     "/api/v1/predict",
     summary="Delineate field boundaries within village GeoJSON",
+    response_model=dict[str, object],
     responses={
-        200: {"description": "GeoJSON FeatureCollection of predictions clipped to supplied village boundaries"},
-        # P2-2: typed error responses so OpenAPI spec shows the exact error schema
+        200: {
+            "description": "GeoJSON FeatureCollection of predictions clipped to supplied village boundaries",
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "type": {"type": "string"},
+                            "crs": {"type": "object"},
+                            "features": {"type": "array", "items": {"type": "object"}},
+                        },
+                        "additionalProperties": True,
+                    }
+                }
+            },
+        },
         404: {"model": ErrorResponse, "description": "No villages match the requested taluka"},
         422: {"model": ErrorResponse, "description": "Invalid village GeoJSON or geometry too large"},
         502: {"model": ErrorResponse, "description": "Imagery provider request failed"},
@@ -227,6 +249,17 @@ def health():
     "/api/v1/predict/stream",
     summary="Stream field boundary predictions with live progress events (SSE)",
     response_class=StreamingResponse,
+    responses={
+        200: {
+            "description": "Server-sent event stream of status/progress updates and final GeoJSON result",
+            "content": {"text/event-stream": {"schema": {"type": "string"}}},
+        },
+        404: {"model": ErrorResponse, "description": "No villages match the requested taluka"},
+        422: {"model": ErrorResponse, "description": "Invalid village GeoJSON or geometry too large"},
+        502: {"model": ErrorResponse, "description": "Imagery provider request failed"},
+        504: {"model": ErrorResponse, "description": "Prediction timed out — village may be too large"},
+        500: {"model": ErrorResponse, "description": "Internal inference error"},
+    },
 )
 async def predict_stream(req: PredictRequest):
     """

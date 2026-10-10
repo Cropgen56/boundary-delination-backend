@@ -26,6 +26,7 @@ RUN pip install -r requirements.txt
 RUN useradd --create-home --uid 1000 appuser
 
 COPY --chown=appuser:appuser app/ /app/app/
+COPY --chown=appuser:appuser ui/ /app/ui/
 
 # Model weights are baked into the image so it runs standalone (e.g. on Cloud Run).
 # ft_best.pt must be in the project root when building (it is not in git).

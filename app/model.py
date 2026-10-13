@@ -41,11 +41,9 @@ class TripleHeadModel(nn.Module):
 
     def forward(self, x: torch.Tensor):
         features = self.encoder(x)
-        # `segmentation_models_pytorch`'s UnetDecoder.forward expects the encoder
-        # feature list as variadic positional arguments, not as a single list.
-        # Using `*features` matches the installed library API while staying
-        # compatible with the standard encoder/decoder split used by this model.
-        decoder_out = self.decoder(*features)
+        # segmentation-models-pytorch >= 0.5 (pinned in requirements.txt) takes the
+        # encoder feature list as a single argument; `*features` raises TypeError.
+        decoder_out = self.decoder(features)
 
         extent   = self.extent_head(self.extent_dropout(decoder_out))
         boundary = self.boundary_head(self.boundary_dropout(decoder_out))

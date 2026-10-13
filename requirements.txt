@@ -3,9 +3,13 @@ fastapi
 uvicorn[standard]
 python-multipart
 
-# ML
-torch
-segmentation-models-pytorch>=0.5  # UnetDecoder.forward takes a list since 0.5
+# ML — pinned as a matched set; ft_best.pt was verified against exactly these.
+# torch and torchvision must move together (torchvision 0.X pairs with torch 2.(X-15)),
+# otherwise torchvision's C++ ops fail to register ("operator torchvision::nms does not exist").
+torch==2.14.1
+torchvision==0.29.1
+timm==1.0.30
+segmentation-models-pytorch==0.5.0  # UnetDecoder.forward takes a list since 0.5
 
 # Geospatial
 rasterio

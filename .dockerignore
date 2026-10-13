@@ -15,3 +15,5 @@ example/
 *.pth
 Dockerfile
 docker-compose.yml
+# Local imagery cache
+data/

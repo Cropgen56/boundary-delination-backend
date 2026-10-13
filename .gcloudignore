@@ -1,0 +1,10 @@
+# Files uploaded by `gcloud builds submit`. Without this file gcloud falls back
+# to .gitignore, which drops ft_best.pt and breaks the Docker build.
+*
+!Dockerfile
+!.dockerignore
+!requirements.txt
+!ft_best.pt
+!app/
+!app/**
+app/__pycache__/

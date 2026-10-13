@@ -16,12 +16,24 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends libexpat1 \
     && rm -rf /var/lib/apt/lists/*
 
-# torch and torchvision must come from the same index, or torchvision's C++ ops
-# fail to load ("operator torchvision::nms does not exist").
-RUN pip install --index-url ${TORCH_INDEX_URL} torch torchvision
+# torch and torchvision must be a matched pair from the same index, or torchvision's
+# C++ ops fail to load ("operator torchvision::nms does not exist"). Versions must
+# match the pins in requirements.txt; the +cpu builds satisfy those pins, so the
+# second pip install below leaves them alone instead of pulling PyPI CUDA wheels.
+ARG TORCH_VERSION=2.14.1
+ARG TORCHVISION_VERSION=0.29.1
+RUN pip install --index-url ${TORCH_INDEX_URL} \
+        torch==${TORCH_VERSION} torchvision==${TORCHVISION_VERSION}
 
 COPY requirements.txt .
-RUN pip install -r requirements.txt
+RUN pip install -r requirements.txt \
+    && pip check
+
+# Fail the build (not the Cloud Run startup) if torch/torchvision are mismatched.
+RUN python -c "import torch, torchvision, timm, segmentation_models_pytorch as smp; \
+torch.ops.torchvision.nms; \
+print('torch', torch.__version__, '| torchvision', torchvision.__version__, \
+'| timm', timm.__version__, '| smp', smp.__version__)"
 
 RUN useradd --create-home --uid 1000 appuser
 
@@ -32,6 +44,9 @@ COPY --chown=appuser:appuser ui/ /app/ui/
 # ft_best.pt must be in the project root when building (it is not in git).
 COPY --chown=appuser:appuser ft_best.pt /app/checkpoints/ft_best.pt
 ENV CHECKPOINT_PATH=/app/checkpoints/ft_best.pt
+
+# Imagery cache (app/inference.py writes to /app/data); appuser cannot create dirs in /app.
+RUN mkdir -p /app/data && chown appuser:appuser /app/data
 
 USER appuser
 

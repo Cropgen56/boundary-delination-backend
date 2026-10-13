@@ -7,4 +7,6 @@
 !ft_best.pt
 !app/
 !app/**
+!ui/
+!ui/**
 app/__pycache__/

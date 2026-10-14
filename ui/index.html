@@ -141,6 +141,20 @@
     #run-btn:active:not(:disabled) { transform: translateY(0); }
     #run-btn:disabled { opacity: .4; cursor: not-allowed; transform: none; }
 
+    /* Download button */
+    #download-btn {
+      width: 100%; padding: 11px; margin-top: 10px;
+      background: linear-gradient(135deg, #2563eb, #1d4ed8);
+      color: #fff; font-family: var(--font); font-size: 13px; font-weight: 600;
+      border: 1px solid rgba(147, 197, 253, 0.3); border-radius: var(--radius); cursor: pointer;
+      display: flex; align-items: center; justify-content: center; gap: 8px;
+      transition: all .2s ease;
+      letter-spacing: 0.2px;
+      box-shadow: 0 2px 8px rgba(37, 99, 235, 0.25);
+    }
+    #download-btn:hover { background: linear-gradient(135deg, #3b82f6, #2563eb); transform: translateY(-1px); box-shadow: 0 4px 12px rgba(37, 99, 235, 0.35); }
+    #download-btn:active { transform: translateY(0); }
+
     /* Overall progress bar */
     .progress-wrap { background: var(--border); border-radius: 99px; height: 6px; overflow: hidden; }
     .progress-bar {
@@ -293,6 +307,15 @@
         <div class="dz-label"><strong>Drop a GeoJSON file</strong> or click to browse</div>
       </div>
 
+      <!-- Force rerun option -->
+      <div style="display:flex;align-items:center;justify-content:space-between;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);padding:8px 12px;margin-bottom:10px">
+        <label for="force-rerun-chk" style="display:flex;align-items:center;gap:8px;cursor:pointer;user-select:none;font-size:12px;font-weight:500;color:var(--text)">
+          <input type="checkbox" id="force-rerun-chk" style="width:14px;height:14px;accent-color:var(--green);cursor:pointer" />
+          <span>🔄 <strong>Force Rerun</strong></span>
+        </label>
+        <span style="font-size:10px;color:var(--muted);font-family:var(--mono)">Bypass S3 Cache</span>
+      </div>
+
       <!-- Run -->
       <button id="run-btn" disabled onclick="runInference()">
         <span id="btn-icon">🚀</span>
@@ -324,6 +347,10 @@
           <div class="stat"><div class="stat-val" id="s-avg">—</div><div class="stat-lbl">Avg field size (ha)</div></div>
           <div class="stat"><div class="stat-val" id="s-device">—</div><div class="stat-lbl">Compute device</div></div>
         </div>
+        <button id="download-btn" onclick="downloadGeoJSON()">
+          <span>📥</span>
+          <span>Download GeoJSON</span>
+        </button>
       </div>
 
       <!-- Log -->
@@ -359,6 +386,7 @@ let resultLayer  = null;
 
 /* ── State ───────────────────────────────────────────────────────────────── */
 let loadedGeoJSON = null;
+let lastResultGeoJSON = null;
 
 /* ── Pipeline step definitions ───────────────────────────────────────────── */
 const STEPS = [
@@ -415,21 +443,29 @@ function buildSteps() {
 }
 
 function activateStep(key, msg) {
+  // map pipeline sub-steps to main UI step keys
+  const stepMap = {
+    'splitting': 'watershed',
+    'merging':   'watershed',
+    'funnel':    'postprocess',
+  };
+  const targetKey = stepMap[key] || key;
+
   // mark previous active step as done
   STEPS.forEach(s => {
     const el = $('step-' + s.key);
-    if (el && el.classList.contains('active')) {
+    if (el && el.classList.contains('active') && s.key !== targetKey) {
       el.classList.remove('active');
       el.classList.add('done');
       $('step-badge-' + s.key).textContent = 'DONE';
     }
   });
-  const el = $('step-' + key);
+  const el = $('step-' + targetKey);
   if (!el) return;
   el.classList.remove('pending', 'done', 'error');
   el.classList.add('active');
-  if (msg) $('step-msg-' + key).textContent = msg;
-  $('step-badge-' + key).innerHTML = '<div class="spinner"></div>';
+  if (msg) $('step-msg-' + targetKey).textContent = msg;
+  $('step-badge-' + targetKey).innerHTML = '<div class="spinner"></div>';
 }
 
 function doneStep(key) {
@@ -517,6 +553,7 @@ checkHealth();
 
 /* ── Draw result polygons ────────────────────────────────────────────────── */
 function drawResult(fc) {
+  lastResultGeoJSON = fc;
   if (resultLayer) map.removeLayer(resultLayer);
   resultLayer = L.geoJSON(fc, {
     style: () => ({
@@ -527,13 +564,26 @@ function drawResult(fc) {
     }),
     onEachFeature: (feat, layer) => {
       const p = feat.properties || {};
+      const rows = [
+        `<tr><td style="color:#888;padding:2px 0">Area</td><td style="text-align:right;font-weight:600">${p.area_ha ?? '?'} ha</td></tr>`,
+        `<tr><td style="color:#888;padding:2px 0">Perimeter</td><td style="text-align:right">${p.perimeter_m ?? '?'} m</td></tr>`,
+      ];
+      if (p.qc) {
+        const qcColor = p.qc === 'ok' ? '#22c55e' : (p.qc === 'oversize' ? '#ef4444' : '#f59e0b');
+        rows.push(`<tr><td style="color:#888;padding:2px 0">QC Status</td><td style="text-align:right"><span style="color:${qcColor};font-weight:600;text-transform:uppercase;font-size:10px;padding:1px 6px;background:${qcColor}22;border-radius:4px">${p.qc}</span></td></tr>`);
+      }
+      if (p.level) rows.push(`<tr><td style="color:#888;padding:2px 0">Level</td><td style="text-align:right">${p.level}</td></tr>`);
+      if (p.name || p.village) rows.push(`<tr><td style="color:#888;padding:2px 0">Village</td><td style="text-align:right">${p.name || p.village}</td></tr>`);
+      if (p.taluka) rows.push(`<tr><td style="color:#888;padding:2px 0">Taluka</td><td style="text-align:right">${p.taluka}</td></tr>`);
+      if (p.district) rows.push(`<tr><td style="color:#888;padding:2px 0">District</td><td style="text-align:right">${p.district}</td></tr>`);
+      if (p.state) rows.push(`<tr><td style="color:#888;padding:2px 0">State</td><td style="text-align:right">${p.state}</td></tr>`);
+      if (p.census_code) rows.push(`<tr><td style="color:#888;padding:2px 0">Census</td><td style="text-align:right">${p.census_code}</td></tr>`);
+
       layer.bindPopup(`
-        <div style="font-family:Inter,sans-serif;font-size:12px;min-width:160px">
+        <div style="font-family:Inter,sans-serif;font-size:12px;min-width:180px">
           <b style="color:#22c55e">Field #${p.field_id ?? '?'}</b>
           <table style="margin-top:6px;width:100%;border-collapse:collapse">
-            <tr><td style="color:#888;padding:2px 0">Area</td><td style="text-align:right;font-weight:600">${p.area_ha ?? '?'} ha</td></tr>
-            <tr><td style="color:#888;padding:2px 0">Perimeter</td><td style="text-align:right">${p.perimeter_m ?? '?'} m</td></tr>
-            ${p.village ? `<tr><td style="color:#888;padding:2px 0">Village</td><td style="text-align:right">${p.village}</td></tr>` : ''}
+            ${rows.join('')}
           </table>
         </div>
       `);
@@ -553,6 +603,26 @@ function drawResult(fc) {
   $('stats-section').style.display = '';
 }
 
+/* ── Download result GeoJSON ─────────────────────────────────────────────── */
+function downloadGeoJSON() {
+  if (!lastResultGeoJSON) return;
+  const props = (lastResultGeoJSON.features?.[0]?.properties) || loadedGeoJSON?.properties || {};
+  const vname = props.name || props.village || $('vname').textContent.trim() || 'boundaries';
+  const cleanName = vname.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+  const filename = `${cleanName || 'field'}_boundaries.geojson`;
+
+  const blob = new Blob([JSON.stringify(lastResultGeoJSON, null, 2)], { type: 'application/geo+json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+  log(`Downloaded ${filename} (${lastResultGeoJSON.features?.length || 0} fields)`, 'ok');
+}
+
 /* ── Run inference via SSE ───────────────────────────────────────────────── */
 async function runInference() {
   if (!loadedGeoJSON) return;
@@ -569,13 +639,20 @@ async function runInference() {
   buildSteps();
   setProgress(0, 'Connecting…');
   setStatus('Streaming', true);
-  log('Starting SSE inference stream…', 'inf');
+  const forceRerun = $('force-rerun-chk')?.checked || false;
+  if (forceRerun) {
+    log('🔄 Force rerun requested — will bypass S3 cached field boundaries', 'inf');
+  }
 
   try {
-    const resp = await fetch(`${API}/api/v1/predict/stream`, {
+    const streamUrl = `${API}/api/v1/predict/stream${forceRerun ? '?force_rerun=true' : ''}`;
+    const resp = await fetch(streamUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ geojson: loadedGeoJSON }),
+      body: JSON.stringify({
+        geojson: loadedGeoJSON,
+        force_rerun: forceRerun,
+      }),
     });
 
     if (!resp.ok) {
@@ -627,10 +704,19 @@ function handleEvent(ev) {
       break;
 
     case 'progress': {
-      activateStep(ev.step, ev.message);
-      setProgress(ev.pct, ev.message);
-      log(ev.message);
-      if (ev.step === 'complete') doneStep('complete');
+      if (ev.step === 'cache') {
+        STEPS.forEach(s => doneStep(s.key));
+        setProgress(100, 'Loaded from S3 cache');
+        log('⚡ S3 Cache Hit: Loaded precomputed boundaries from S3!', 'ok');
+      } else if (ev.step === 'cache_bypass') {
+        setProgress(5, 'Bypassing S3 cache…');
+        log('🔄 ' + ev.message, 'inf');
+      } else {
+        activateStep(ev.step, ev.message);
+        setProgress(ev.pct, ev.message);
+        log(ev.message);
+        if (ev.step === 'complete') doneStep('complete');
+      }
       break;
     }
 

@@ -498,6 +498,26 @@ export CACHE_MAX_GB=5
 export CHECKPOINT_PATH=/path/to/checkpoint.pt
 ```
 
+### S3 prediction-result cache
+
+Set `S3_BUCKET` to enable the shared result cache. The AWS SDK uses its standard
+credential chain, so use an IAM role in deployment or provide AWS credentials
+through your normal local AWS configuration. The application needs `s3:GetObject`
+and `s3:PutObject` access to the configured bucket and prefix.
+
+```bash
+export S3_BUCKET=my-boundary-cache
+export S3_PREFIX=boundary-results
+export AWS_REGION=ap-south-1
+export RESULT_CACHE_VERSION=v1
+```
+
+The cache is checked before inference by both prediction endpoints. On a miss,
+the completed field GeoJSON is stored in S3. `RESULT_CACHE_VERSION` is part of
+the object key; change it when the model or prediction algorithm changes to
+avoid reusing results from an older pipeline. If `S3_BUCKET` is unset, the
+service runs without an S3 result cache.
+
 ---
 
 ## 10. Local development and running the server

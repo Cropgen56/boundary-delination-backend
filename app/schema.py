@@ -17,6 +17,10 @@ class PredictRequest(BaseModel):
         None,
         description="Optionally process only features whose properties.taluka matches this name.",
     )
+    force_rerun: bool = Field(
+        default=False,
+        description="If True, bypasses cached S3 field boundaries and re-runs model inference and postprocessing.",
+    )
 
     @model_validator(mode="before")
     @classmethod

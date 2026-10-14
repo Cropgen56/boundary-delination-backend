@@ -16,6 +16,7 @@ from app.inference import (
     extract_fields,
 )
 from app.schema import PredictRequest, HealthResponse, ErrorResponse
+from app.result_cache import get_cached_fields, store_cached_fields
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +128,24 @@ def _sse_json(data: dict) -> str:
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
+def _extract_or_load_cached(village: dict, progress_callback=None, force_rerun: bool = False) -> dict:
+    """Reuse completed S3 results, falling back to normal field extraction."""
+    if not force_rerun:
+        cached = get_cached_fields(village)
+        if cached is not None:
+            if progress_callback:
+                progress_callback('cache', 'Returning cached field boundaries from S3.', 100)
+            return cached
+    elif progress_callback:
+        progress_callback('cache_bypass', 'Bypassing S3 cache (force rerun requested) …', 5)
+
+    result = extract_fields(
+        village, model=model, device=device, progress_callback=progress_callback
+    )
+    store_cached_fields(village, result)
+    return result
+
+
 # ── Routes ─────────────────────────────────────────────────────────────────────
 
 @app.post(
@@ -157,27 +176,30 @@ def _sse_json(data: dict) -> str:
         500: {"model": ErrorResponse, "description": "Internal inference error"},
     },
 )
-async def predict(req: PredictRequest):
+async def predict(req: PredictRequest, force_rerun: bool = False):
     """
     **Request body fields**
 
     The body can be a raw GeoJSON Feature, FeatureCollection, or feature array.
     To filter by taluka, use `{ "geojson": <GeoJSON>, "taluka": "Bhiwapur" }`.
+    To bypass S3 cache, pass `force_rerun: true` in body or `?force_rerun=true` in query.
 
     | Field | Type | Required | Default | Description |
     |-------|------|----------|---------|-------------|
     | `geojson` | object or array | ✅ | — | Village Feature, FeatureCollection, or array of Features |
     | `taluka` | string | ❌ | — | Filter supplied village Features by `properties.taluka` |
+    | `force_rerun` | boolean | ❌ | false | If True, bypasses cached S3 field boundaries |
 
     **Example**
     ```json
-    { "geojson": { "type": "Feature", "geometry": { "type": "Polygon", "coordinates": [] }, "properties": { "name": "Mangrud", "taluka": "Bhiwapur" } }, "taluka": "Bhiwapur" }
+    { "geojson": { "type": "Feature", "geometry": { "type": "Polygon", "coordinates": [] }, "properties": { "name": "Mangrud", "taluka": "Bhiwapur" } }, "force_rerun": true }
     ```
     """
     villages = _parse_villages(req)
+    should_force = req.force_rerun or force_rerun
     logger.info(
-        'Prediction request started: villages=%d, taluka=%s.',
-        len(villages), req.taluka or 'not specified',
+        'Prediction request started: villages=%d, taluka=%s, force_rerun=%s.',
+        len(villages), req.taluka or 'not specified', should_force,
     )
     try:
         predicted_features = []
@@ -189,7 +211,7 @@ async def predict(req: PredictRequest):
                 async with _inference_semaphore:
                     prediction = await asyncio.wait_for(
                         asyncio.to_thread(
-                            extract_fields, village, model=model, device=device
+                            _extract_or_load_cached, village, force_rerun=should_force
                         ),
                         timeout=300,
                     )
@@ -203,9 +225,10 @@ async def predict(req: PredictRequest):
                     ),
                 )
             for feature in prediction.get("features", []):
-                feature_properties = dict(feature.get("properties") or {})
-                feature_properties["village"] = properties.get("name")
-                feature_properties["taluka"] = properties.get("taluka")
+                feature_properties = dict(properties)
+                feature_properties.update(feature.get("properties") or {})
+                if "name" in properties and "village" not in feature_properties:
+                    feature_properties["village"] = properties["name"]
                 feature["properties"] = feature_properties
                 predicted_features.append(feature)
             logger.info(
@@ -261,7 +284,7 @@ def health():
         500: {"model": ErrorResponse, "description": "Internal inference error"},
     },
 )
-async def predict_stream(req: PredictRequest):
+async def predict_stream(req: PredictRequest, force_rerun: bool = False):
     """
     Identical input to `/api/v1/predict` but returns a **text/event-stream** (SSE)
     response so clients can display real-time pipeline progress.
@@ -275,6 +298,7 @@ async def predict_stream(req: PredictRequest):
     - `error`        — something went wrong (`detail`)
     """
     villages = _parse_villages(req)
+    should_force = req.force_rerun or force_rerun
 
     async def event_stream():
         loop = asyncio.get_running_loop()
@@ -295,7 +319,7 @@ async def predict_stream(req: PredictRequest):
                 props = village.get("properties") or {}
                 vname = props.get("name", "unnamed")
                 yield _sse_json({"type": "village_start", "index": idx, "name": vname})
-                logger.info('SSE stream: starting village %s.', vname)
+                logger.info('SSE stream: starting village %s (force_rerun=%s).', vname, should_force)
 
                 # Sentinel placed in the queue when the thread finishes
                 result_holder: list = []
@@ -303,11 +327,10 @@ async def predict_stream(req: PredictRequest):
 
                 async def _run(v=village):
                     try:
-                        res = await asyncio.to_thread(
-                            extract_fields, v,
-                            model=model, device=device,
-                            progress_callback=_progress,
-                        )
+                        async with _inference_semaphore:
+                            res = await asyncio.to_thread(
+                                _extract_or_load_cached, v, progress_callback=_progress, force_rerun=should_force
+                            )
                         result_holder.append(res)
                     except Exception as exc:  # noqa: BLE001
                         error_holder.append(exc)
@@ -348,9 +371,10 @@ async def predict_stream(req: PredictRequest):
 
                 result = result_holder[0] if result_holder else {"features": []}
                 for feat in result.get("features", []):
-                    fp = dict(feat.get("properties") or {})
-                    fp["village"] = props.get("name")
-                    fp["taluka"]  = props.get("taluka")
+                    fp = dict(props)
+                    fp.update(feat.get("properties") or {})
+                    if "name" in props and "village" not in fp:
+                        fp["village"] = props["name"]
                     feat["properties"] = fp
                     all_features.append(feat)
 

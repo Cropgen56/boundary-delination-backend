@@ -20,6 +20,8 @@ geopandas
 # Imagery / HTTP
 Pillow
 requests
+boto3
+python-dotenv
 
 # Preprocessing
 numpy

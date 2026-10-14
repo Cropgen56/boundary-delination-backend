@@ -55,6 +55,13 @@ SMALL_FIELD_HA   = float(os.environ.get('SMALL_FIELD_HA', 0.10))
 MAX_FIELD_HA     = float(os.environ.get('MAX_FIELD_HA', 22.0))
 CLIP_TO_VILLAGE  = os.environ.get('CLIP_TO_VILLAGE', 'true').lower() in ('true', '1', 'yes')
 
+# ── Road & Urban auxiliary masking ────────────────────────────────────────────
+ENABLE_ROAD_MASK     = os.environ.get('ENABLE_ROAD_MASK', 'true').lower() in ('true', '1', 'yes')
+ENABLE_URBAN_MASK    = os.environ.get('ENABLE_URBAN_MASK', 'true').lower() in ('true', '1', 'yes')
+ROAD_BARRIER_ELEV    = float(os.environ.get('ROAD_BARRIER_ELEV', 1.0))
+OSM_GPKG_PATH        = os.environ.get('OSM_GPKG_PATH', '').strip()
+OSM_URBAN_GPKG_PATH  = os.environ.get('OSM_URBAN_GPKG_PATH', '').strip()
+
 # ── Input safety limits ───────────────────────────────────────────────────────
 # Villages whose UTM bounding box exceeds this area are rejected with HTTP 422
 # before any imagery is fetched, preventing OOM on extremely large inputs.

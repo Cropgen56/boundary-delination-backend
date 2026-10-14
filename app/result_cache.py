@@ -307,3 +307,77 @@ def store_cached_imagery_async(
     )
     thread.start()
     return thread
+
+
+# ── Auxiliary road and urban mask cache ────────────────────────────────────────
+
+def _aux_npz_key(digest: str) -> str:
+    """Return S3 object key for cached auxiliary masks npz."""
+    return f'{S3_PREFIX}/auxiliary/{digest}.npz' if S3_PREFIX else f'auxiliary/{digest}.npz'
+
+
+def get_cached_auxiliary(digest: str, expected_shape: tuple[int, int]) -> tuple[np.ndarray, np.ndarray] | None:
+    """Check S3 for cached road and urban masks."""
+    if not S3_BUCKET:
+        return None
+
+    client = _client()
+    key = _aux_npz_key(digest)
+    try:
+        response = client.get_object(Bucket=S3_BUCKET, Key=key)
+        raw = response['Body'].read()
+        payload = np.load(io.BytesIO(raw))
+        road_mask = payload['road_mask']
+        urban_mask = payload['urban_mask']
+        if road_mask.shape == expected_shape and urban_mask.shape == expected_shape:
+            logger.info('Loaded auxiliary masks from S3: s3://%s/%s', S3_BUCKET, key)
+            return road_mask.astype(bool), urban_mask.astype(bool)
+    except Exception as exc:
+        err_code = getattr(exc, 'response', {}).get('Error', {}).get('Code')
+        if err_code not in ('NoSuchKey', '404', 'NotFound'):
+            logger.warning('Error reading auxiliary cache from S3 (key=%s): %s', key, exc)
+    return None
+
+
+def store_cached_auxiliary(digest: str, road_mask: np.ndarray, urban_mask: np.ndarray):
+    """Store road and urban masks in S3 as compressed npz."""
+    if not S3_BUCKET:
+        return
+
+    client = _client()
+    key = _aux_npz_key(digest)
+    try:
+        bio = io.BytesIO()
+        np.savez_compressed(
+            bio,
+            road_mask=road_mask.astype(bool),
+            urban_mask=urban_mask.astype(bool),
+        )
+        bio.seek(0)
+        client.put_object(
+            Bucket=S3_BUCKET,
+            Key=key,
+            Body=bio.getvalue(),
+            ContentType='application/octet-stream',
+            Metadata={
+                'version': RESULT_CACHE_VERSION,
+                'shape': f'{road_mask.shape[0]}x{road_mask.shape[1]}',
+            },
+        )
+        logger.info('Stored auxiliary masks in S3: s3://%s/%s (%d bytes)', S3_BUCKET, key, bio.getbuffer().nbytes)
+    except Exception as exc:
+        logger.warning('Failed to persist auxiliary masks to S3 (key=%s): %s', key, exc)
+
+
+def store_cached_auxiliary_async(digest: str, road_mask: np.ndarray, urban_mask: np.ndarray):
+    """Background upload of auxiliary masks to S3."""
+    import threading
+
+    thread = threading.Thread(
+        target=store_cached_auxiliary,
+        args=(digest, road_mask.copy(), urban_mask.copy()),
+        daemon=True,
+        name=f"s3-upload-aux-{digest[:8]}",
+    )
+    thread.start()
+    return thread

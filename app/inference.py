@@ -65,6 +65,7 @@ from app.config import (
     MAX_BBOX_KM2, CACHE_MAX_GB,
     ESRI_MAX_WORKERS, ESRI_IMAGE_FORMAT, ESRI_JPEG_QUALITY,
     ESRI_TIMEOUT_SEC, ESRI_MAX_CHUNK_PX,
+    ENABLE_ROAD_MASK, ENABLE_URBAN_MASK, ROAD_BARRIER_ELEV,
 )
 from app.result_cache import (
     geometry_cache_digest,
@@ -72,6 +73,7 @@ from app.result_cache import (
     store_cached_imagery_async,
     store_cached_fields,
 )
+from app.auxiliary import fetch_road_and_urban_masks
 
 # ── Feature detection for simplify_coverage ───────────────────────────────────
 HAS_COVERAGE = hasattr(gpd.GeoSeries, 'simplify_coverage')
@@ -432,13 +434,16 @@ def _robust_norm(a: np.ndarray, mask: np.ndarray | None = None, lo: float = 2.0,
 
 def extract_instances_v2(extent_prob: np.ndarray, boundary_prob: np.ndarray,
                          distance_pred: np.ndarray, village_mask: np.ndarray,
+                         road_mask: np.ndarray | None = None,
+                         urban_mask: np.ndarray | None = None,
                          extent_thresh: float = EXTENT_THRESH, seed_bnd_max: float = SEED_BND_MAX,
                          seed_dist_min: float = SEED_DIST_MIN, seed_min_px: int = SEED_MIN_PX,
                          edge_sigma: float = EDGE_SIGMA, dist_weight: float = DIST_WEIGHT,
-                         min_px: int = MIN_REGION_PX, rescue_orphans: bool = RESCUE_ORPHANS
+                         min_px: int = MIN_REGION_PX, rescue_orphans: bool = RESCUE_ORPHANS,
+                         road_barrier_elev: float = ROAD_BARRIER_ELEV
                          ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
     """
-    v2 instance extraction using field cores.
+    v2 instance extraction using field cores with road barrier and urban exclusion.
     Returns (labels, elev [flooding surface], bp [smoothed boundary prob], info).
     """
     # closing with disk(1), not disk(2): a 2-px closing bridges the 1-3 m bunds between fields
@@ -447,16 +452,28 @@ def extract_instances_v2(extent_prob: np.ndarray, boundary_prob: np.ndarray,
     )
     extent_mask &= village_mask
 
+    # Exclude urban / settlement areas from extent
+    if urban_mask is not None and urban_mask.any():
+        extent_mask &= ~urban_mask
+
     bp = gaussian_filter(boundary_prob.astype('float32'), sigma=edge_sigma) if edge_sigma else boundary_prob.astype('float32')
     dist = _robust_norm(gaussian_filter(distance_pred.astype('float32'), 1.0), extent_mask)
 
     seed_mask = extent_mask & (bp < seed_bnd_max) & (dist > seed_dist_min)
+    # Zero out core seeds that sit on road networks
+    if road_mask is not None and road_mask.any():
+        seed_mask &= ~road_mask
+
     seed_mask = ndi.binary_opening(seed_mask, structure=disk(1))     # break 1-px bridges between cores
     markers, _ = ndi.label(seed_mask)
     markers = drop_small_regions(markers, seed_min_px)
     n_seeded = len(np.unique(markers)) - 1
 
     elev = bp + dist_weight * (1.0 - dist)
+    # Enforce roads as impassable mountain ridges on the flooding elevation surface
+    if road_mask is not None and road_mask.any():
+        elev = np.where(road_mask, road_barrier_elev, elev)
+
     labels = watershed(elev, markers, mask=extent_mask)
 
     n_rescued = 0
@@ -790,6 +807,18 @@ def extract_fields(village_feature: dict, model, device,
         progress_callback=progress_callback,
     )
 
+    # 1b. Auxiliary road and urban masks
+    road_mask, urban_mask = None, None
+    if ENABLE_ROAD_MASK or ENABLE_URBAN_MASK:
+        _emit('auxiliary', 'Retrieving road barrier and urban masks …', 35)
+        road_mask, urban_mask = fetch_road_and_urban_masks(
+            minx, miny, maxx, maxy, utm_crs,
+            shape=mosaic.shape[1:],
+            transform=transform,
+            village_cache_key=village_cache_key,
+            progress_callback=progress_callback,
+        )
+
     # 2. Inference
     _emit('inference', 'Running sliding-window model inference …', 40)
     inference_started_at = time.perf_counter()
@@ -819,6 +848,7 @@ def extract_fields(village_feature: dict, model, device,
     if SEED_MODE == 'cores':
         labels, edge, bp_s, info = extract_instances_v2(
             extent_prob, boundary_prob, distance_pred, village_mask,
+            road_mask=road_mask, urban_mask=urban_mask,
             extent_thresh=EXTENT_THRESH, seed_bnd_max=SEED_BND_MAX,
             seed_dist_min=SEED_DIST_MIN, seed_min_px=SEED_MIN_PX,
             edge_sigma=EDGE_SIGMA, dist_weight=DIST_WEIGHT,
@@ -844,8 +874,10 @@ def extract_fields(village_feature: dict, model, device,
 
     if SEED_MODE == 'cores':
         _emit('merging', 'Merging weak boundaries & smoothing labels …', 76)
+        # Protect road borders from weak boundary merges
+        bp_merge = np.where(road_mask, 1.0, bp_s) if road_mask is not None else bp_s
         labels, n_merged = merge_weak_boundaries(
-            labels, bp_s, thresh=MERGE_BND_T,
+            labels, bp_merge, thresh=MERGE_BND_T,
             max_area_px=MAX_FIELD_HA * 1e4 / px_area,
         )
         if LABEL_SMOOTH_R > 0:

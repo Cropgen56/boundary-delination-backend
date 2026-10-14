@@ -41,9 +41,13 @@ class TripleHeadModel(nn.Module):
 
     def forward(self, x: torch.Tensor):
         features = self.encoder(x)
-        # segmentation-models-pytorch >= 0.5 (pinned in requirements.txt) takes the
-        # encoder feature list as a single argument; `*features` raises TypeError.
-        decoder_out = self.decoder(features)
+        # Compatible across segmentation-models-pytorch versions:
+        # smp < 0.5 expects `self.decoder(*features)` (variadic args)
+        # smp >= 0.5 expects `self.decoder(features)` (single list)
+        try:
+            decoder_out = self.decoder(*features)
+        except (TypeError, IndexError):
+            decoder_out = self.decoder(features)
 
         extent   = self.extent_head(self.extent_dropout(decoder_out))
         boundary = self.boundary_head(self.boundary_dropout(decoder_out))

@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from app.model import load_model
+from app.model import load_model, load_models
 from app.inference import (
     ImageryFetchError,
     InvalidVillageGeometryError,
@@ -26,6 +26,7 @@ _inference_semaphore = asyncio.Semaphore(1)
 # Module-level refs populated by lifespan (typed for static analysis)
 device: torch.device
 model:  torch.nn.Module
+models: dict[str, torch.nn.Module]
 
 
 # ── P1-2: lifespan replaces bare module-level load_model() call ───────────────
@@ -33,30 +34,31 @@ model:  torch.nn.Module
 # the server from starting, rather than crashing mid-import with a stack trace.
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global model, device
+    global model, device, models
     if torch.cuda.is_available():
         device = torch.device('cuda')
     elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
         device = torch.device('mps')
     else:
         device = torch.device('cpu')
-    logger.info('Loading field boundary model on %s …', device)
-    model = load_model()
-    model.to(device)
-    logger.info('Field boundary model ready on %s.', device)
+    logger.info('Loading field boundary models on %s …', device)
+    models = load_models()
+    for m in set(models.values()):
+        m.to(device)
+        m.to(memory_format=torch.channels_last)
+    model = models['boundary']
+    logger.info('Field boundary models ready on %s.', device)
     yield
-    # nothing to release for a pure-inference model, but the hook is here
-    # if GPU memory or other resources need explicit cleanup in future.
 
 
 app = FastAPI(
-    title="Field Boundary Detection API — v2.0",
+    title="Field Boundary Detection API — v5.0",
     description=(
-        "Triple-head EfficientNet-B4 UNet model (fine-tuned on Kurankhed data). "
+        "Triple-head EfficientNet-B4 UNet model (ft21_best.pt / v5 inference). "
         "Pass village GeoJSON from the boundary service to get field boundaries "
         "clipped to each village polygon. Multiple villages can be processed together."
     ),
-    version="2.0.0",
+    version="5.0.0",
     lifespan=lifespan,
 )
 
@@ -140,7 +142,7 @@ def _extract_or_load_cached(village: dict, progress_callback=None, force_rerun: 
         progress_callback('cache_bypass', 'Bypassing S3 cache (force rerun requested) …', 5)
 
     result = extract_fields(
-        village, model=model, device=device, progress_callback=progress_callback
+        village, model=models, device=device, progress_callback=progress_callback
     )
     store_cached_fields(village, result)
     return result

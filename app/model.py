@@ -1,8 +1,10 @@
+import os
 import torch
 import torch.nn as nn
 import segmentation_models_pytorch as smp
 
 from app.config import CHECKPOINT_PATH
+
 
 
 class TripleHeadModel(nn.Module):
@@ -56,12 +58,30 @@ class TripleHeadModel(nn.Module):
         return extent, boundary, distance
 
 
-def load_model() -> TripleHeadModel:
+def load_model(checkpoint_path: str | None = None) -> TripleHeadModel:
     """Load fine-tuned TripleHeadModel from checkpoint. encoder_weights=None so
     imagenet weights are NOT downloaded at startup — only the saved state dict
     is used."""
+    path = checkpoint_path or CHECKPOINT_PATH
     model = TripleHeadModel(encoder_weights=None)
-    checkpoint = torch.load(CHECKPOINT_PATH, map_location='cpu', weights_only=True)
+    checkpoint = torch.load(path, map_location='cpu', weights_only=True)
     model.load_state_dict(checkpoint['model'])
     model.eval()
     return model
+
+
+def load_models(extent_path: str | None = None,
+                boundary_path: str | None = None) -> dict[str, TripleHeadModel]:
+    """Load extent and boundary models. If both paths point to the same file,
+    returns the same instance to conserve memory."""
+    from app.config import EXTENT_CHECKPOINT_PATH, BOUNDARY_CHECKPOINT_PATH
+
+    ext_p = extent_path or EXTENT_CHECKPOINT_PATH
+    bnd_p = boundary_path or BOUNDARY_CHECKPOINT_PATH
+
+    m_ext = load_model(ext_p)
+    if os.path.abspath(ext_p) == os.path.abspath(bnd_p):
+        return {'extent': m_ext, 'boundary': m_ext}
+
+    m_bnd = load_model(bnd_p)
+    return {'extent': m_ext, 'boundary': m_bnd}

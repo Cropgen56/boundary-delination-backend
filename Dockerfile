@@ -41,9 +41,8 @@ COPY --chown=appuser:appuser app/ /app/app/
 COPY --chown=appuser:appuser ui/ /app/ui/
 
 # Model weights are baked into the image so it runs standalone (e.g. on Cloud Run).
-# ft_best.pt must be in the project root when building (it is not in git).
-COPY --chown=appuser:appuser ft_best.pt /app/checkpoints/ft_best.pt
-ENV CHECKPOINT_PATH=/app/checkpoints/ft_best.pt
+COPY --chown=appuser:appuser checkpoints/ /app/checkpoints/
+ENV CHECKPOINT_PATH=/app/checkpoints/ft21_best.pt
 
 # Imagery cache (app/inference.py writes to /app/data); appuser cannot create dirs in /app.
 RUN mkdir -p /app/data && chown appuser:appuser /app/data

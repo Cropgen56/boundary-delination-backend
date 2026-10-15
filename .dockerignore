@@ -7,13 +7,15 @@ __pycache__/
 .DS_Store
 .vscode/
 notebooks/
-checkpoints/
 example/
 *.nc
-*.pt
-!ft_best.pt
 *.pth
 Dockerfile
 docker-compose.yml
 # Local imagery cache
 data/
+
+# Model checkpoints: allow checkpoints folder and its .pt weights
+!checkpoints/
+checkpoints/*
+!checkpoints/*.pt
